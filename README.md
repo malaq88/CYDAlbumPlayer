@@ -6,8 +6,57 @@ Special thanks to **Sparkadium** and the original project **[Cheap-Yellow-MP3-Pl
 
 ESP32 “CYD” music player that:
 - Scans your SD card by albums (folders) and plays `.mp3` / `.wav` tracks.
-- Shows a retro cassette UI on the TFT with touch controls.
+- Shows a **DAP-style player screen** (dark theme, status bar, cassette artwork with red/black reels, progress bar, timestamps, technical line in cyan) plus touch transport controls.
+- Uses the **on-board RGB LED** on the back as a Bluetooth / playback indicator.
 - Acts as a **Bluetooth A2DP Source** (sends the audio to a Bluetooth speaker/headset).
+
+## RGB status LED (rear of CYD)
+
+On typical **ESP32-2432S028R** boards, the rear RGB LED uses three GPIOs and is **active-low** (LOW = LED on):
+
+| Channel | GPIO |
+|--------|------|
+| Red    | 4    |
+| Green  | 16   |
+| Blue   | 17   |
+
+**Behaviour in this sketch**
+
+| State | LED pattern |
+|-------|-------------|
+| Bluetooth **not** connected (pairing / searching) | Alternating **red** and **blue** blink. |
+| Bluetooth connected and track **playing** | **Blue** blink (connection + “now playing”). |
+| Bluetooth connected but **paused** / **stopped** | LED off. |
+
+The Bluetooth wait loop at startup calls the same update routine so the LED animates while the A2DP sink connects.
+
+Clones may use different pins or polarity; adjust `RGB_LED_RED` / `RGB_LED_GREEN` / `RGB_LED_BLUE` in `CYDAlbumPlayer.ino` if needed.
+
+**Note (front “R21” / clear dome):** On many CYD boards, silkscreen **R21** is a **resistor** designator, not a separate software-driven LED. A clear component on the front is often the **LDR** (light sensor on GPIO 34) — it is read as an analog input, not toggled like the RGB LED.
+
+## Player UI (main playback screen)
+
+The playback view is laid out for a **320×240** landscape panel and is inspired by compact digital audio players (high contrast, minimal chrome).
+
+- **Top bar:** headphone glyph, **track index / total**, **album folder name** (truncated), **BT** badge, decorative battery outline, **BACK** control.
+- **Title line:** current track name (file name without extension), centered above the cassette.
+- **Cassette:** dark shell, window with tape texture, **red outer rings** and **black hubs**, animated reel spokes while playing.
+- **Info block (updated ~every 450 ms while playing or paused):**
+  - Thin **progress bar** (fill uses the same red accent as the reels when duration is known).
+  - **Elapsed** and **total** time as `HH:MM:SS`; total shows `--:--:--` when duration is unknown.
+  - Folder line (dim text).
+  - **Cyan** technical line: **`WAV / sample-rate Hz / PCM`** when parsed from the file header, or **`MP3 / ~128 kbps (est.)`** for MP3.
+
+**Timing**
+
+- Elapsed time respects **pause / resume** (wall-clock with accumulated pause duration).
+- **WAV** duration and sample rate come from parsing `fmt` / `data` chunks on the SD card.
+- **MP3** total length and bitrate are **estimated** from file size (assumes ~128 kbps CBR); VBR or unusual files may be off — the UI labels MP3 as estimated.
+
+**Touch targets**
+
+- **BACK** (top-right) returns to the album browser and stops playback.
+- **Prev / Play–Pause / Next** are in the bottom transport bar (see `PL_TRANSPORT_Y` in the sketch).
 
 ## Hardware / Pinout used by this sketch
 
