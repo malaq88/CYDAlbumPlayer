@@ -4,6 +4,7 @@
 
 #include <Arduino.h>
 #include <stdint.h>
+#include <string.h>
 #include <SD.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
@@ -22,6 +23,12 @@
 #define TOUCH_CS   33
 #define TOUCH_IRQ  36
 #define TFT_BL     21
+
+// RGB traseiro da CYD (ESP32-2432S028R): R=4, G=16, B=17 — ativo em LOW (LOW = aceso).
+// Alguns clones podem variar; o LED “da frente” em muitos modelos é só o reflexo/chassi, não outro GPIO.
+#define RGB_LED_RED    4
+#define RGB_LED_GREEN 16
+#define RGB_LED_BLUE   17
 
 #define TOUCH_MOSI 32
 #define TOUCH_MISO 39
@@ -45,6 +52,23 @@ XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
 #define COL_BTN      tft.color565(30, 30, 30)
 #define COL_BTN_ACT  tft.color565(70, 70, 70)
 #define COL_DIR      tft.color565(35, 45, 70)
+
+// Player screen (estilo DAP / fita)
+static const int PL_HEADER_H       = 22;
+static const int PL_CASSETTE_TOP   = 40;
+static const int PL_REEL_CY        = 94;
+static const int PL_REEL_LX        = 108;
+static const int PL_REEL_RX        = 212;
+static const int PL_PROGRESS_TOP   = 144;
+static const int PL_PROGRESS_H     = 54;
+static const int PL_TRANSPORT_Y    = 200;
+
+static inline uint16_t colReelRed()   { return tft.color565(215, 45, 50); }
+static inline uint16_t colReelHub()   { return tft.color565(160, 160, 165); }
+static inline uint16_t colTapeBody()  { return tft.color565(42, 42, 46); }
+static inline uint16_t colTapeEdge()  { return tft.color565(75, 75, 80); }
+static inline uint16_t colInfoCyan()  { return tft.color565(88, 190, 245); }
+static inline uint16_t colTopBarBg()  { return tft.color565(10, 10, 12); }
 
 static unsigned long lastTouchTime = 0;
 static const unsigned long TOUCH_DEBOUNCE_MS = 220;
@@ -108,6 +132,65 @@ static AudioType currentType = AUDIO_NONE;
 enum PlayerState { STATE_STOPPED, STATE_PLAYING, STATE_PAUSED };
 static PlayerState playerState = STATE_STOPPED;
 
+// ── LED RGB traseiro (estado Bluetooth / reprodução) ─────
+static unsigned long rgbLastMs = 0;
+static bool rgbBlinkPhase = false;
+static bool rgbPrevBt = false;
+static bool rgbPrevPlaying = false;
+
+static inline void rgbLedAllOff() {
+  digitalWrite(RGB_LED_RED, HIGH);
+  digitalWrite(RGB_LED_GREEN, HIGH);
+  digitalWrite(RGB_LED_BLUE, HIGH);
+}
+
+static void rgbLedInit() {
+  pinMode(RGB_LED_RED, OUTPUT);
+  pinMode(RGB_LED_GREEN, OUTPUT);
+  pinMode(RGB_LED_BLUE, OUTPUT);
+  rgbLedAllOff();
+}
+
+/** Sem fone: pisca vermelho/azul (tentando conectar). Conectado + tocando: pisca azul. Conectado parado: apagado. */
+static void rgbLedUpdate() {
+  unsigned long now = millis();
+  const bool bt = a2dp.is_connected();
+  const bool playing = (playerState == STATE_PLAYING);
+
+  if (bt != rgbPrevBt || playing != rgbPrevPlaying) {
+    rgbPrevBt = bt;
+    rgbPrevPlaying = playing;
+    rgbLastMs = now;
+    rgbBlinkPhase = false;
+    rgbLedAllOff();
+  }
+
+  if (bt && playing) {
+    if (now - rgbLastMs >= 450) {
+      rgbLastMs = now;
+      rgbBlinkPhase = !rgbBlinkPhase;
+    }
+    digitalWrite(RGB_LED_RED, HIGH);
+    digitalWrite(RGB_LED_GREEN, HIGH);
+    digitalWrite(RGB_LED_BLUE, rgbBlinkPhase ? LOW : HIGH);
+  } else if (!bt) {
+    if (now - rgbLastMs >= 280) {
+      rgbLastMs = now;
+      rgbBlinkPhase = !rgbBlinkPhase;
+    }
+    digitalWrite(RGB_LED_GREEN, HIGH);
+    if (rgbBlinkPhase) {
+      digitalWrite(RGB_LED_RED, LOW);
+      digitalWrite(RGB_LED_BLUE, HIGH);
+    } else {
+      digitalWrite(RGB_LED_RED, HIGH);
+      digitalWrite(RGB_LED_BLUE, LOW);
+    }
+  } else {
+    rgbLedAllOff();
+  }
+}
+
 // ── Albums / tracks ────────────────────────────────────────
 #define MAX_ALBUMS 32
 #define MAX_TRACKS 128
@@ -116,6 +199,8 @@ static PlayerState playerState = STATE_STOPPED;
 static char albums[MAX_ALBUMS][MAX_ALBUM_NAME_LEN];
 static int albumCount = 0;
 static int albumScroll = 0;
+
+static char currentAlbumFolder[MAX_ALBUM_NAME_LEN];
 
 static char albumTracks[MAX_TRACKS][128]; // full paths
 static int albumTrackCount = 0;
@@ -156,6 +241,104 @@ static void getDisplayName(const char* path, char* out, int maxLen) {
   if (dot) *dot = '\0';
 }
 
+/** Duração WAV a partir do cartão (chunks fmt/data); *outRate = sample rate Hz se não for NULL. */
+static uint32_t wavParseDurationAndRate(const char* path, uint32_t* outRate) {
+  if (outRate) *outRate = 0;
+  File f = SD.open(path, FILE_READ);
+  if (!f) return 0;
+  uint8_t riff[12];
+  if (f.read(riff, 12) < 12 || memcmp(riff, "RIFF", 4) != 0 || memcmp(riff + 8, "WAVE", 4) != 0) {
+    f.close();
+    return 0;
+  }
+  uint16_t numCh = 0, bitsPerSample = 0;
+  uint32_t sampleRate = 0, dataSize = 0;
+  bool haveData = false;
+
+  while (f.available()) {
+    uint8_t cid[4], szb[4];
+    if (f.read(cid, 4) < 4 || f.read(szb, 4) < 4) break;
+    uint32_t chunkSize = (uint32_t)szb[0] | ((uint32_t)szb[1] << 8) | ((uint32_t)szb[2] << 16) | ((uint32_t)szb[3] << 24);
+
+    if (memcmp(cid, "fmt ", 4) == 0) {
+      if (chunkSize < 16) {
+        f.seek(chunkSize + (chunkSize & 1u), SeekCur);
+        continue;
+      }
+      uint8_t fmt[16];
+      if (f.read(fmt, 16) < 16) break;
+      numCh = (uint16_t)(fmt[2] | (fmt[3] << 8));
+      sampleRate = (uint32_t)fmt[4] | ((uint32_t)fmt[5] << 8) | ((uint32_t)fmt[6] << 16) | ((uint32_t)fmt[7] << 24);
+      bitsPerSample = (uint16_t)(fmt[14] | (fmt[15] << 8));
+      uint32_t skip = chunkSize - 16;
+      if (skip > 0) f.seek(skip, SeekCur);
+      if (chunkSize & 1u) f.seek(1, SeekCur);
+    } else if (memcmp(cid, "data", 4) == 0) {
+      dataSize = chunkSize;
+      haveData = true;
+      break;
+    } else {
+      f.seek(chunkSize + (chunkSize & 1u), SeekCur);
+    }
+  }
+  f.close();
+  if (outRate) *outRate = sampleRate;
+  uint32_t bps = sampleRate * (uint32_t)numCh * ((uint32_t)bitsPerSample / 8u);
+  if (bps == 0 || !haveData) return 0;
+  return dataSize / bps;
+}
+
+static void formatTimeHMS(char* buf, size_t n, uint32_t sec) {
+  uint32_t h = sec / 3600u;
+  uint32_t m = (sec % 3600u) / 60u;
+  uint32_t s = sec % 60u;
+  snprintf(buf, n, "%02lu:%02lu:%02lu", (unsigned long)h, (unsigned long)m, (unsigned long)s);
+}
+
+/** Uma linha centrada (texto 1); corta com ".." se não couber em maxPx. */
+static void drawTitleCentered(int y, int maxPx, const char* s) {
+  char buf[52];
+  strncpy(buf, s ? s : "", sizeof(buf) - 1);
+  buf[sizeof(buf) - 1] = '\0';
+  const int charW = 6;
+  int maxChars = maxPx / charW - 2;
+  if (maxChars < 6) maxChars = 6;
+  int len = (int)strlen(buf);
+  if (len > maxChars) {
+    buf[maxChars - 2] = '\0';
+    strcat(buf, "..");
+  }
+  tft.setTextSize(1);
+  int w = (int)strlen(buf) * charW;
+  tft.setCursor(160 - w / 2, y);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  tft.print(buf);
+}
+
+// ── Playback timeline (relógio pausa/resume coerente) ───────
+static unsigned long trackWallStartMs   = 0;
+static unsigned long accumulatedPauseMs = 0;
+static unsigned long pauseBeganMs       = 0;
+static uint32_t      cachedDurationSec  = 0;
+static uint32_t      cachedWavRateHz    = 0;
+static unsigned long lastProgressUiMs   = 0;
+
+static uint32_t clampElapsedSec(uint32_t el) {
+  if (cachedDurationSec > 0 && el > cachedDurationSec) return cachedDurationSec;
+  return el;
+}
+
+static uint32_t elapsedPlaybackSec() {
+  if (playerState == STATE_STOPPED || trackWallStartMs == 0) return 0;
+  if (playerState == STATE_PAUSED && pauseBeganMs >= trackWallStartMs) {
+    return clampElapsedSec((uint32_t)((pauseBeganMs - trackWallStartMs - accumulatedPauseMs) / 1000ul));
+  }
+  if (playerState == STATE_PLAYING) {
+    return clampElapsedSec((uint32_t)((millis() - trackWallStartMs - accumulatedPauseMs) / 1000ul));
+  }
+  return 0;
+}
+
 // ── SD: scan albums (folders in root) ───────────────────────
 static void scanAlbums() {
   albumCount = 0;
@@ -188,6 +371,9 @@ static void scanAlbums() {
 static void loadAlbumTracks(const char* albumName) {
   albumTrackCount = 0;
   if (!albumName || !albumName[0]) return;
+
+  strncpy(currentAlbumFolder, albumName, sizeof(currentAlbumFolder) - 1);
+  currentAlbumFolder[sizeof(currentAlbumFolder) - 1] = '\0';
 
   char dirPath[96];
   snprintf(dirPath, sizeof(dirPath), "/%s", albumName);
@@ -226,6 +412,11 @@ static void stopTrack() {
   playerState = STATE_STOPPED;
   rbHead = 0;
   rbTail = 0;
+  trackWallStartMs = 0;
+  accumulatedPauseMs = 0;
+  pauseBeganMs = 0;
+  cachedDurationSec = 0;
+  cachedWavRateHz = 0;
 }
 
 static void startTrack(int idx) {
@@ -250,6 +441,19 @@ static void startTrack(int idx) {
   }
 
   playerState = STATE_PLAYING;
+  trackWallStartMs = millis();
+  accumulatedPauseMs = 0;
+  pauseBeganMs = 0;
+  cachedWavRateHz = 0;
+  if (currentType == AUDIO_WAV) {
+    cachedDurationSec = wavParseDurationAndRate(albumTracks[currentTrack], &cachedWavRateHz);
+  } else if (audioFile && currentType == AUDIO_MP3) {
+    uint32_t sz = audioFile->getSize();
+    cachedDurationSec = (sz > 0) ? (sz / 16000u) : 0;
+    if (cachedDurationSec == 0 && sz > 8000u) cachedDurationSec = 1;
+  } else {
+    cachedDurationSec = 0;
+  }
 
   // Pre-fill for BT stability
   int loops = 0;
@@ -266,36 +470,36 @@ static void startTrack(int idx) {
 static void nextTrack() { startTrack(currentTrack + 1); }
 static void prevTrack() { startTrack(currentTrack - 1); }
 static void togglePause() {
-  if (playerState == STATE_PLAYING) playerState = STATE_PAUSED;
-  else if (playerState == STATE_PAUSED) playerState = STATE_PLAYING;
+  if (playerState == STATE_PLAYING) {
+    playerState = STATE_PAUSED;
+    pauseBeganMs = millis();
+  } else if (playerState == STATE_PAUSED) {
+    if (pauseBeganMs) {
+      accumulatedPauseMs += (millis() - pauseBeganMs);
+      pauseBeganMs = 0;
+    }
+    playerState = STATE_PLAYING;
+  }
 }
 
 // ── Cassete animation (reels) ───────────────────────────────
 static unsigned long lastReelAnimMs = 0;
 static int reelAngleDeg = 0;
 
-static void drawReelSpokes(int cx, int cy, int angleDeg, uint16_t spokeColor) {
-  // Clear only the core area to avoid excessive flicker.
-  uint16_t reelCore = tft.color565(30, 30, 30);
+static void drawReelSpokes(int cx, int cy, int angleDeg, uint16_t spokeColor, uint16_t hubRingColor) {
+  uint16_t reelCore = tft.color565(16, 16, 18);
   tft.fillCircle(cx, cy, 10, reelCore);
+  tft.drawCircle(cx, cy, 8, hubRingColor);
 
-  // Inner ring for finishing.
-  tft.drawCircle(cx, cy, 8, COL_ACCENT);
-
-  // Arduino/ESP32 already defines DEG_TO_RAD; don't redeclare.
-  const float degToRad = 1.0f / 57.2957795f; // PI/180
-  const int len = 15;
-
-  // 3 "spokes" to simulate rotation
+  const float degToRad = 1.0f / 57.2957795f;
+  const int len = 14;
   for (int i = 0; i < 3; i++) {
     float a = (angleDeg + i * 120) * degToRad;
     int x2 = cx + (int)(cos(a) * len);
     int y2 = cy + (int)(sin(a) * len);
     tft.drawLine(cx, cy, x2, y2, spokeColor);
   }
-
-  // Center point
-  tft.fillCircle(cx, cy, 3, spokeColor);
+  tft.fillCircle(cx, cy, 3, hubRingColor);
 }
 
 static void updateReelAnimation() {
@@ -308,14 +512,8 @@ static void updateReelAnimation() {
 
   reelAngleDeg = (reelAngleDeg + 18) % 360; // velocidade da rotação
 
-  // Reel positions in the current layout
-  int reelCy = 145;
-  int reelLx = 110;
-  int reelRx = 210;
-
-  // Left and right rotate in opposite directions for a more "realistic" look
-  drawReelSpokes(reelLx, reelCy, reelAngleDeg, COL_ACCENT);
-  drawReelSpokes(reelRx, reelCy, -reelAngleDeg, COL_ACCENT);
+  drawReelSpokes(PL_REEL_LX, PL_REEL_CY, reelAngleDeg, colReelHub(), colReelRed());
+  drawReelSpokes(PL_REEL_RX, PL_REEL_CY, -reelAngleDeg, colReelHub(), colReelRed());
 }
 
 // ── Render ─────────────────────────────────────────────────
@@ -378,148 +576,178 @@ static void drawBrowser() {
   }
 }
 
+/** Barra de progresso, tempos e metadados técnicos (atualização periódica no loop). */
+static void drawPlayerProgressArea() {
+  if (screenMode != SCREEN_PLAYER) return;
+
+  const int y0 = PL_PROGRESS_TOP;
+  tft.fillRect(0, y0, 320, PL_PROGRESS_H, COL_BG);
+
+  uint32_t el = elapsedPlaybackSec();
+  char tEl[16], tTot[16];
+  formatTimeHMS(tEl, sizeof(tEl), el);
+  if (cachedDurationSec > 0) formatTimeHMS(tTot, sizeof(tTot), cachedDurationSec);
+  else {
+    strncpy(tTot, "--:--:--", sizeof(tTot) - 1);
+    tTot[sizeof(tTot) - 1] = '\0';
+  }
+
+  const int bx = 10, by = y0 + 2, bw = 300, bh = 6;
+  tft.drawRoundRect(bx, by, bw, bh + 2, 2, COL_DIM);
+  tft.fillRect(bx + 1, by + 1, bw - 2, bh, tft.color565(22, 22, 26));
+  if (cachedDurationSec > 0) {
+    uint32_t fw = (uint32_t)(((uint64_t)el * (uint64_t)(bw - 4)) / (uint64_t)cachedDurationSec);
+    if (fw > (uint32_t)(bw - 4)) fw = (uint32_t)(bw - 4);
+    if (fw > 0) tft.fillRect(bx + 2, by + 2, (int)fw, bh - 2, colReelRed());
+  }
+
+  tft.setTextSize(1);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  if (playerState == STATE_PLAYING) {
+    tft.fillTriangle(10, y0 + 18, 10, y0 + 24, 16, y0 + 21, COL_TEXT);
+  } else {
+    tft.fillRect(10, y0 + 17, 3, 8, COL_TEXT);
+    tft.fillRect(14, y0 + 17, 3, 8, COL_TEXT);
+  }
+  tft.setCursor(22, y0 + 16);
+  tft.print(tEl);
+  tft.setCursor(232, y0 + 16);
+  tft.print(tTot);
+
+  tft.setTextColor(COL_DIM, COL_BG);
+  tft.setCursor(10, y0 + 28);
+  tft.print(currentAlbumFolder[0] ? currentAlbumFolder : "-");
+
+  tft.setTextColor(colInfoCyan(), COL_BG);
+  tft.setCursor(10, y0 + 40);
+  if (currentType == AUDIO_WAV && cachedWavRateHz > 0)
+    tft.printf("WAV / %lu Hz / PCM", (unsigned long)cachedWavRateHz);
+  else if (currentType == AUDIO_MP3)
+    tft.print("MP3 / ~128 kbps (est.)");
+  else
+    tft.print("---");
+}
+
 static void drawPlayer() {
   tft.fillScreen(COL_BG);
 
-  tft.fillRect(0, 0, 320, 24, COL_BTN);
-  tft.setTextColor(COL_TEXT, COL_BTN);
-  tft.setTextSize(1);
-  tft.setCursor(8, 9);
-  tft.print("Player");
+  // ── Barra de estado (estilo DAP) ─────────────────────────
+  tft.fillRect(0, 0, 320, PL_HEADER_H, colTopBarBg());
+  tft.drawFastHLine(0, PL_HEADER_H - 1, 320, tft.color565(40, 40, 48));
 
-  tft.fillRoundRect(252, 2, 64, 20, 4, COL_ACCENT);
-  tft.setTextColor(COL_BG, COL_ACCENT);
+  tft.drawRoundRect(4, 4, 11, 13, 2, COL_DIM);
+  tft.drawFastVLine(15, 8, 6, COL_TEXT);
+  tft.drawFastHLine(15, 8, 4, COL_TEXT);
+
+  tft.setTextColor(COL_TEXT, colTopBarBg());
   tft.setTextSize(1);
-  tft.setCursor(268, 9);
+  tft.setCursor(22, 7);
+  if (albumTrackCount > 0) tft.printf("%d/%d", currentTrack + 1, albumTrackCount);
+  else tft.print("-/-");
+
+  {
+    char abuf[26];
+    const char* src = currentAlbumFolder[0] ? currentAlbumFolder : "-";
+    strncpy(abuf, src, sizeof(abuf) - 1);
+    abuf[sizeof(abuf) - 1] = '\0';
+    int mc = (int)sizeof(abuf) - 4;
+    if ((int)strlen(abuf) > mc) {
+      abuf[mc] = '\0';
+      strcat(abuf, "..");
+    }
+    tft.setCursor(72, 7);
+    tft.print(abuf);
+  }
+
+  uint16_t btCol = a2dp.is_connected() ? tft.color565(60, 200, 90) : tft.color565(200, 60, 60);
+  tft.fillRoundRect(196, 4, 26, 14, 3, tft.color565(30, 30, 34));
+  tft.setTextColor(btCol, colTopBarBg());
+  tft.setCursor(202, 8);
+  tft.print(BT_SPEAKER_NAME);
+
+  tft.drawRect(228, 6, 20, 11, COL_DIM);
+  tft.fillRect(230, 8, 14, 7, tft.color565(70, 140, 80));
+
+  tft.fillRoundRect(256, 3, 60, 16, 3, tft.color565(36, 36, 42));
+  tft.setTextColor(colInfoCyan(), tft.color565(36, 36, 42));
+  tft.setCursor(266, 8);
   tft.print("BACK");
 
-  // ============================================================
-  // Retro design: "cassette tape" (behind the buttons)
-  // ============================================================
-  uint16_t cassetteEdge  = tft.color565(170, 170, 170);
-  uint16_t cassetteMain  = tft.color565(60, 60, 60);
-  uint16_t cassetteLabel = tft.color565(24, 24, 24);
-  uint16_t windowBg      = tft.color565(8, 8, 8);
-  uint16_t reelEdge      = tft.color565(120, 120, 120);
-  uint16_t reelCore      = tft.color565(30, 30, 30);
-
-  // Outer body
-  tft.fillRoundRect(8, 55, 304, 160, 14, cassetteEdge);
-  tft.fillRoundRect(12, 59, 296, 152, 12, cassetteMain);
-
-  // Label
-  tft.fillRoundRect(70, 72, 180, 28, 6, cassetteLabel);
-  tft.fillRoundRect(74, 76, 172, 20, 4, cassetteMain);
-
-  // Side panels like a "speaker grill"
-  uint16_t hole = tft.color565(10, 10, 10);
-  for (int gx = 22; gx <= 44; gx += 5) {
-    for (int gy = 96; gy <= 166; gy += 8) {
-      tft.fillCircle(gx, gy, 1, hole);
-      tft.fillCircle(320 - gx, gy, 1, hole);
-    }
-  }
-
-  // Tape window
-  tft.fillRoundRect(48, 105, 224, 80, 12, windowBg);
-
-  // Reels
-  int reelCy = 145;
-  int reelLx = 110;
-  int reelRx = 210;
-
-  tft.fillCircle(reelLx, reelCy, 20, reelCore);
-  tft.drawCircle(reelLx, reelCy, 20, reelEdge);
-  tft.drawCircle(reelLx, reelCy, 8, COL_ACCENT);
-
-  tft.fillCircle(reelRx, reelCy, 20, reelCore);
-  tft.drawCircle(reelRx, reelCy, 20, reelEdge);
-  tft.drawCircle(reelRx, reelCy, 8, COL_ACCENT);
-
-  // Reels at rest + animated in loop
-  drawReelSpokes(reelLx, reelCy, reelAngleDeg, COL_ACCENT);
-  drawReelSpokes(reelRx, reelCy, -reelAngleDeg, COL_ACCENT);
-
-  // Simple texture (diagonal lines)
-  uint16_t tapeLine = tft.color565(20, 160, 90);
-  for (int i = 0; i < 14; i++) {
-    int x1 = 60 + i * 6;
-    int y1 = 112 + i;
-    int x2 = x1 + 20;
-    int y2 = y1 + 12;
-    tft.drawLine(x1, y1, x2, y2, tapeLine);
-  }
-
-  // "REC" indicator LED (static)
-  uint16_t ledCol = (playerState == STATE_PLAYING) ? COL_ACCENT : COL_DIM;
-  tft.fillRoundRect(16, 70, 22, 10, 3, ledCol);
-  tft.setTextColor(cassetteMain, ledCol);
-  tft.setTextSize(1);
-  tft.setCursor(19, 73);
-  tft.print("REC");
-
+  // ── Título da faixa ─────────────────────────────────────
   char title[64];
   if (albumTrackCount > 0) getDisplayName(albumTracks[currentTrack], title, sizeof(title));
-  else strncpy(title, "No track", sizeof(title) - 1);
+  else strncpy(title, "Sem faixa", sizeof(title) - 1);
   title[sizeof(title) - 1] = '\0';
+  drawTitleCentered(24, 300, title);
 
-  // Text inside the cassette label
-  tft.setTextColor(COL_TEXT, cassetteLabel);
-  tft.setTextSize(1);
-  tft.setCursor(84, 80);
-  tft.print(title);
+  // ── Corpo da cassetes / fita ────────────────────────────
+  tft.fillRoundRect(10, PL_CASSETTE_TOP, 300, 98, 11, colTapeEdge());
+  tft.fillRoundRect(14, PL_CASSETTE_TOP + 4, 292, 90, 8, colTapeBody());
 
-  int y = 188;
-  tft.fillRoundRect(10, y, 70, 50, 8, COL_BTN);
-  tft.fillRoundRect(90, y, 140, 50, 8, COL_BTN);
-  tft.fillRoundRect(240, y, 70, 50, 8, COL_BTN);
-
-  // Navigation icons (ShuffleCYDgen style)
-  uint16_t fg = COL_TEXT;
-  int cy = y + 50 / 2;
-
-  // PREV: |◄◄
-  {
-    int cxPrev = 10 + 70 / 2; // 45
-    tft.fillRect(cxPrev - 20, cy - 16, 3, 32, fg); // barra
-    // Double triangle pointing left
-    tft.fillTriangle(cxPrev - 2, cy, cxPrev - 2 + 12, cy - 12, cxPrev - 2 + 12, cy + 12, fg);
-    tft.fillTriangle(cxPrev + 10, cy, cxPrev + 10 + 12, cy - 12, cxPrev + 10 + 12, cy + 12, fg);
-  }
-
-  // PLAY/PAUSE
-  {
-    int cxPlay = 90 + 140 / 2; // 160
-    if (playerState == STATE_PLAYING) {
-      // pause: ||
-      int wBar = 8;
-      int gap = 6;
-      tft.fillRect(cxPlay - gap - wBar, cy - 18, wBar, 36, fg);
-      tft.fillRect(cxPlay + gap,        cy - 18, wBar, 36, fg);
-    } else {
-      // play: ►
-      int size = 26;
-      tft.fillTriangle(cxPlay - size / 3, cy - size / 2,
-                       cxPlay - size / 3, cy + size / 2,
-                       cxPlay + size / 2, cy,
-                       fg);
+  for (int gx = 22; gx <= 40; gx += 6) {
+    for (int gy = PL_CASSETTE_TOP + 18; gy <= PL_CASSETTE_TOP + 84; gy += 10) {
+      tft.fillCircle(gx, gy, 1, tft.color565(18, 18, 22));
+      tft.fillCircle(320 - gx, gy, 1, tft.color565(18, 18, 22));
     }
   }
 
-  // NEXT: ►►|
-  {
-    int cxNext = 240 + 70 / 2; // 275
-    // Double triangle pointing right
-    tft.fillTriangle(cxNext - 10 - 12, cy - 12, cxNext - 10 - 12, cy + 12, cxNext - 10, cy, fg);
-    tft.fillTriangle(cxNext - 2 - 12,  cy - 12, cxNext - 2 - 12,  cy + 12, cxNext - 2,  cy, fg);
-    // final bar
-    tft.fillRect(cxNext + 8, cy - 16, 3, 32, fg);
+  tft.fillRoundRect(44, PL_CASSETTE_TOP + 16, 232, 70, 9, tft.color565(4, 4, 6));
+
+  for (int side = 0; side < 2; side++) {
+    int lx = (side == 0) ? PL_REEL_LX : PL_REEL_RX;
+    tft.fillCircle(lx, PL_REEL_CY, 21, colReelRed());
+    tft.fillCircle(lx, PL_REEL_CY, 14, TFT_BLACK);
+    tft.fillCircle(lx, PL_REEL_CY, 11, tft.color565(38, 38, 42));
   }
 
-  tft.setTextColor(COL_DIM, COL_BG);
-  tft.setTextSize(1);
-  tft.setCursor(10, 92);
-  tft.printf("%d/%d", currentTrack + 1, albumTrackCount);
+  drawReelSpokes(PL_REEL_LX, PL_REEL_CY, reelAngleDeg, colReelHub(), colReelRed());
+  drawReelSpokes(PL_REEL_RX, PL_REEL_CY, -reelAngleDeg, colReelHub(), colReelRed());
+
+  uint16_t tapeLine = tft.color565(35, 150, 95);
+  for (int i = 0; i < 16; i++) {
+    int x1 = 58 + i * 5;
+    int y1 = PL_CASSETTE_TOP + 22 + i;
+    tft.drawLine(x1, y1, x1 + 18, y1 + 11, tapeLine);
+  }
+
+  drawPlayerProgressArea();
+  lastProgressUiMs = millis();
+
+  // ── Transporte ───────────────────────────────────────────
+  const int y = PL_TRANSPORT_Y;
+  tft.fillRoundRect(10, y, 70, 38, 7, COL_BTN);
+  tft.fillRoundRect(90, y, 140, 38, 7, COL_BTN);
+  tft.fillRoundRect(240, y, 70, 38, 7, COL_BTN);
+
+  uint16_t fg = COL_TEXT;
+  int cy = y + 38 / 2;
+
+  {
+    int cxPrev = 10 + 70 / 2;
+    tft.fillRect(cxPrev - 18, cy - 14, 3, 28, fg);
+    tft.fillTriangle(cxPrev - 2, cy, cxPrev - 2 + 11, cy - 11, cxPrev - 2 + 11, cy + 11, fg);
+    tft.fillTriangle(cxPrev + 8, cy, cxPrev + 8 + 11, cy - 11, cxPrev + 8 + 11, cy + 11, fg);
+  }
+  {
+    int cxPlay = 90 + 140 / 2;
+    if (playerState == STATE_PLAYING) {
+      int wBar = 7;
+      int gap = 5;
+      tft.fillRect(cxPlay - gap - wBar, cy - 15, wBar, 30, fg);
+      tft.fillRect(cxPlay + gap, cy - 15, wBar, 30, fg);
+    } else {
+      int size = 22;
+      tft.fillTriangle(cxPlay - size / 3, cy - size / 2,
+                       cxPlay - size / 3, cy + size / 2,
+                       cxPlay + size / 2, cy, fg);
+    }
+  }
+  {
+    int cxNext = 240 + 70 / 2;
+    tft.fillTriangle(cxNext - 10 - 11, cy - 11, cxNext - 10 - 11, cy + 11, cxNext - 10, cy, fg);
+    tft.fillTriangle(cxNext - 2 - 11, cy - 11, cxNext - 2 - 11, cy + 11, cxNext - 2, cy, fg);
+    tft.fillRect(cxNext + 7, cy - 14, 3, 28, fg);
+  }
 }
 
 // ── Touch ─────────────────────────────────────────────────
@@ -585,7 +813,7 @@ static void handleTouch() {
     }
   } else { // SCREEN_PLAYER
     // BACK: stop playback and return to browser
-    if (ty <= 24 && tx >= 252) {
+    if (ty < PL_HEADER_H && tx >= 256) {
       stopTrack();
       screenMode = SCREEN_BROWSER;
       drawBrowser();
@@ -593,8 +821,8 @@ static void handleTouch() {
     }
 
     // controls (center area)
-    int y = 188;
-    if (ty >= y && ty <= y + 50) {
+    int y = PL_TRANSPORT_Y;
+    if (ty >= y && ty <= y + 40) {
       if (tx < 80) prevTrack();
       else if (tx < 230) togglePause();
       else nextTrack();
@@ -607,6 +835,8 @@ static void handleTouch() {
 void setup() {
   Serial.begin(115200);
   delay(500);
+
+  rgbLedInit();
 
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
@@ -648,8 +878,13 @@ void setup() {
   a2dp.start(BT_SPEAKER_NAME, btCallback);
 
   unsigned long t0 = millis();
-  while (!a2dp.is_connected() && millis() - t0 < 15000) delay(50);
+  while (!a2dp.is_connected() && millis() - t0 < 15000) {
+    rgbLedUpdate();
+    delay(50);
+  }
   btConnected = a2dp.is_connected();
+  rgbPrevBt = btConnected;
+  rgbPrevPlaying = (playerState == STATE_PLAYING);
 
   scanAlbums();
   screenMode = SCREEN_BROWSER;
@@ -658,6 +893,17 @@ void setup() {
 }
 
 void loop() {
+  rgbLedUpdate();
+
+  if (screenMode == SCREEN_PLAYER &&
+      (playerState == STATE_PLAYING || playerState == STATE_PAUSED)) {
+    unsigned long now = millis();
+    if (now - lastProgressUiMs >= 450) {
+      lastProgressUiMs = now;
+      drawPlayerProgressArea();
+    }
+  }
+
   if (playerState == STATE_PLAYING) {
     bool decoderAlive = false;
     if (currentType == AUDIO_MP3 && mp3) decoderAlive = mp3->isRunning();
