@@ -6,7 +6,7 @@ Special thanks to **Sparkadium** and the original project **[Cheap-Yellow-MP3-Pl
 
 ESP32 “CYD” music player that:
 - Scans your SD card by albums (folders) and plays `.mp3` / `.wav` tracks.
-- Shows a **DAP-style player screen** (dark theme, status bar, cassette artwork with red/black reels, progress bar, timestamps, technical line in cyan) plus touch transport controls.
+- Shows a **DAP-style player screen** (dark theme, status bar, **spectrum visualizer** — 16 frequency bars driven from the audio, progress bar, timestamps, technical line in cyan) plus volume **+/−** and touch transport controls.
 - Uses the **on-board RGB LED** on the back as a Bluetooth / playback indicator.
 - Acts as a **Bluetooth A2DP Source** (sends the audio to a Bluetooth speaker/headset).
 
@@ -38,11 +38,12 @@ Clones may use different pins or polarity; adjust `RGB_LED_RED` / `RGB_LED_GREEN
 
 The playback view is laid out for a **240×320** portrait panel and is inspired by compact digital audio players (high contrast, minimal chrome).
 
-- **Top bar:** headphone glyph, **track index / total**, **album folder name** (truncated), **BT** badge, decorative battery outline, **BACK** control.
-- **Title line:** current track name (file name without extension), centered above the cassette.
-- **Cassette:** dark shell, window with tape texture, **red outer rings** and **black hubs**, animated reel spokes while playing.
+- **Top bar:** note icon, **track index / total**, **album folder name** (truncated), **BT** badge, **list icon** (top-right) to return to folders.
+- **Title line:** current track name (file name without extension), centered above the visualizer.
+- **Spectrum panel (“SPECTRUM”):** **16 vertical bars** that respond to the music. The sketch taps **mono samples** (L+R after volume gain) from the audio path, runs a **Hamming-windowed block** (256 samples) and **Goertzel** filters at fixed frequencies (~80 Hz–18 kHz). **Per-band AGC** and treble boost keep highs visible; MP3 assumes **44.1 kHz** sample rate for bin mapping (WAV uses the parsed rate). The bar area refreshes ~20×/s while the player screen is shown; bars decay when paused/stopped.
+- **Volume row:** **− / percentage / +** touch buttons (see `PL_VOLUME_Y`).
 - **Info block (updated ~every 450 ms while playing or paused):**
-  - Thin **progress bar** (fill uses the same red accent as the reels when duration is known).
+  - Thin **progress bar** (red fill when duration is known).
   - **Elapsed** and **total** time as `HH:MM:SS`; total shows `--:--:--` when duration is unknown.
   - Folder line (dim text).
   - **Cyan** technical line: **`WAV / sample-rate Hz / PCM`** when parsed from the file header, or **`MP3 / ~128 kbps (est.)`** for MP3.
@@ -55,7 +56,7 @@ The playback view is laid out for a **240×320** portrait panel and is inspired 
 
 **Touch targets**
 
-- **BACK** (top-right) returns to the album browser and stops playback.
+- **List icon** (top-right, `PL_BACK_BTN_*`) returns to the album browser and stops playback.
 - **Prev / Play–Pause / Next** are in the bottom transport bar (see `PL_TRANSPORT_Y` in the sketch).
 
 ## Hardware / Pinout used by this sketch

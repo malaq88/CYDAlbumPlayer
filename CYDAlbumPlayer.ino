@@ -57,25 +57,21 @@ XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
 static const int SCR_W = 240;
 static const int SCR_H = 320;
 
-// Player screen (estilo DAP / fita) - layout retrato
+// Player screen (estilo DAP) - layout retrato
 static const int PL_HEADER_H       = 38;
 static const int PL_TITLE_Y        = 40;  // título da faixa (abaixo da barra)
-static const int PL_CASSETTE_TOP   = 52;
-static const int PL_REEL_CY        = 106;
-static const int PL_REEL_LX        = 72;
-static const int PL_REEL_RX        = 168;
+static const int PL_CASSETTE_TOP   = 52;  // topo do painel do visualizador (barras)
 static const int PL_PROGRESS_TOP   = 164;
 static const int PL_PROGRESS_H     = 56;
 static const int PL_VOLUME_Y       = 224;
 static const int PL_TRANSPORT_Y    = 262;
-// Botão BACK (topo): área de toque explícita
+// Botão lista (topo): volta ao browser; área de toque explícita
 static const int PL_BACK_BTN_X     = 166;
 static const int PL_BACK_BTN_Y     = 4;
 static const int PL_BACK_BTN_W     = 70;
 static const int PL_BACK_BTN_H     = 30;
 
 static inline uint16_t colReelRed()   { return tft.color565(215, 45, 50); }
-static inline uint16_t colReelHub()   { return tft.color565(160, 160, 165); }
 static inline uint16_t colTapeBody()  { return tft.color565(42, 42, 46); }
 static inline uint16_t colTapeEdge()  { return tft.color565(75, 75, 80); }
 static inline uint16_t colInfoCyan()  { return tft.color565(88, 190, 245); }
@@ -99,6 +95,21 @@ static inline size_t rbAvail() {
   size_t h = rbHead, t = rbTail;
   return (h >= t) ? (h - t) : (RING_SIZE - t + h);
 }
+
+// Amostras mono para visualizador (Goertzel por banda)
+#define VIS_BUF_LEN 512
+#define VIS_N       256
+#define NUM_VIS_BARS 16
+static int16_t visRing[VIS_BUF_LEN];
+static volatile uint32_t visWritePos = 0;
+static float visBandVal[NUM_VIS_BARS];
+/** Envelope lento por banda (AGC independente — evita que graves dominem e matem as agudas). */
+static float visBandEnv[NUM_VIS_BARS];
+
+static const float VIS_FREQ_HZ[NUM_VIS_BARS] = {
+  80.f, 125.f, 200.f, 320.f, 500.f, 800.f, 1250.f, 2000.f,
+  3000.f, 4500.f, 6000.f, 8000.f, 10000.f, 12000.f, 15000.f, 18000.f
+};
 
 static int32_t btCallback(Frame *frame, int32_t count) {
   int32_t avail = (int32_t)rbAvail();
@@ -128,6 +139,8 @@ public:
     ring[rbHead * 2]     = constrain(l, -32768, 32767);
     ring[rbHead * 2 + 1] = constrain(r, -32768, 32767);
     rbHead = next;
+    visRing[visWritePos & (VIS_BUF_LEN - 1)] = (int16_t)((l + r) >> 1);
+    visWritePos++;
     return true;
   }
 };
@@ -517,38 +530,134 @@ static void togglePause() {
   }
 }
 
-// ── Cassete animation (reels) ───────────────────────────────
-static unsigned long lastReelAnimMs = 0;
-static int reelAngleDeg = 0;
-
-static void drawReelSpokes(int cx, int cy, int angleDeg, uint16_t spokeColor, uint16_t hubRingColor) {
-  uint16_t reelCore = tft.color565(16, 16, 18);
-  tft.fillCircle(cx, cy, 10, reelCore);
-  tft.drawCircle(cx, cy, 8, hubRingColor);
-
-  const float degToRad = 1.0f / 57.2957795f;
-  const int len = 14;
-  for (int i = 0; i < 3; i++) {
-    float a = (angleDeg + i * 120) * degToRad;
-    int x2 = cx + (int)(cos(a) * len);
-    int y2 = cy + (int)(sin(a) * len);
-    tft.drawLine(cx, cy, x2, y2, spokeColor);
+// ── Visualizador (Goertzel por banda; amostras em visRing no ConsumeSample) ──
+static float visGoertzelMag(const float* x, int N, float freqHz, float sampleRateHz) {
+  const float PI_F = 3.14159265f;
+  if (freqHz <= 0 || freqHz >= sampleRateHz * 0.48f) return 0;
+  float k = (0.5f + ((float)N * freqHz) / sampleRateHz);
+  int ki = (int)k;
+  if (ki < 1) ki = 1;
+  if (ki >= N) ki = N - 1;
+  float omega = (2.0f * PI_F * (float)ki) / (float)N;
+  float sine = sinf(omega);
+  float cosine = cosf(omega);
+  float coeff = 2.0f * cosine;
+  float q0 = 0, q1 = 0, q2 = 0;
+  for (int i = 0; i < N; i++) {
+    q0 = coeff * q1 - q2 + x[i];
+    q2 = q1;
+    q1 = q0;
   }
-  tft.fillCircle(cx, cy, 3, hubRingColor);
+  float real = q1 - q2 * cosine;
+  float imag = q2 * sine;
+  return sqrtf(real * real + imag * imag) / (float)N;
 }
 
-static void updateReelAnimation() {
-  if (playerState != STATE_PLAYING) return;
+static float visSampleRateHz() {
+  if (currentType == AUDIO_WAV && cachedWavRateHz > 0) return (float)cachedWavRateHz;
+  return 44100.0f;
+}
+
+static void computeVisBands() {
+  if (visWritePos < (uint32_t)VIS_N) return;
+  float wf[VIS_N];
+  uint32_t end = visWritePos;
+  for (int i = 0; i < VIS_N; i++) {
+    uint32_t idx = (end - VIS_N + i) & (VIS_BUF_LEN - 1);
+    float s = (float)visRing[idx];
+    float w = 0.54f - 0.46f * cosf(2.0f * 3.14159265f * i / (float)(VIS_N - 1));
+    wf[i] = s * w;
+  }
+  float sr = visSampleRateHz();
+  float raw[NUM_VIS_BARS];
+  for (int b = 0; b < NUM_VIS_BARS; b++) {
+    float fh = VIS_FREQ_HZ[b];
+    if (fh >= sr * 0.45f) fh = sr * 0.45f;
+    raw[b] = visGoertzelMag(wf, VIS_N, fh, sr);
+  }
+
+  // Boost nas agudas (Goertzel em janela curta tem menos energia nas altas) + AGC por banda.
+  for (int b = 0; b < NUM_VIS_BARS; b++) {
+    float treble = 0.55f + (float)b * 0.32f; // ~0.55 … ~5.5
+    float scaled = raw[b] * treble;
+    visBandEnv[b] = visBandEnv[b] * 0.90f + scaled * 0.10f;
+    if (visBandEnv[b] < 1e-7f) visBandEnv[b] = 1e-7f;
+    // Divisor baixo = mais sensível; curva suave (não t²) preserva picos médios
+    float t = scaled / (visBandEnv[b] * 1.35f + 1e-6f);
+    t = powf(t, 0.55f);
+    if (t > 1.0f) t = 1.0f;
+    if (t > visBandVal[b]) visBandVal[b] = visBandVal[b] * 0.28f + t * 0.72f;
+    else visBandVal[b] = visBandVal[b] * 0.72f + t * 0.28f;
+  }
+}
+
+static const int VIS_PX = 8;
+static const int VIS_PY = PL_CASSETTE_TOP;
+static const int VIS_PW = 224;
+static const int VIS_PH = 108;
+static const int VIS_IX = VIS_PX + 10;
+static const int VIS_IY = VIS_PY + 22;
+static const int VIS_IW = VIS_PW - 20;
+static const int VIS_IH = VIS_PH - 34;
+
+static uint16_t visBarColor(int b, float hNorm) {
+  float t = (float)b / (float)((NUM_VIS_BARS > 1) ? (NUM_VIS_BARS - 1) : 1);
+  uint8_t r = (uint8_t)(20.f + t * 120.f + hNorm * 80.f);
+  uint8_t g = (uint8_t)(200.f - t * 140.f + hNorm * 40.f);
+  uint8_t bl = (uint8_t)(160.f + (1.0f - t) * 60.f + hNorm * 30.f);
+  return tft.color565(r, g, bl);
+}
+
+static void drawVisualizerBarsContent() {
+  const int gap = 2;
+  int barW = (VIS_IW - gap * (NUM_VIS_BARS - 1) - 4) / NUM_VIS_BARS;
+  if (barW < 2) barW = 2;
+  const int maxH = VIS_IH - 8;
+  const int baseY = VIS_IY + VIS_IH - 4;
+  for (int b = 0; b < NUM_VIS_BARS; b++) {
+    int x = VIS_IX + 2 + b * (barW + gap);
+    float h = visBandVal[b];
+    int hh = (int)(h * (float)maxH);
+    if (hh > maxH) hh = maxH;
+    if (hh < 1) continue;
+    tft.fillRoundRect(x, baseY - hh, barW, hh, 2, visBarColor(b, h));
+  }
+}
+
+static void redrawVisualizerBarsOnly() {
+  tft.fillRoundRect(VIS_IX, VIS_IY, VIS_IW, VIS_IH, 6, tft.color565(4, 4, 8));
+  drawVisualizerBarsContent();
+}
+
+static void drawVisualizerPanel() {
+  tft.fillRoundRect(VIS_PX, VIS_PY, VIS_PW, VIS_PH, 11, colTapeEdge());
+  tft.fillRoundRect(VIS_PX + 4, VIS_PY + 4, VIS_PW - 8, VIS_PH - 8, 8, colTapeBody());
+  tft.fillRoundRect(VIS_PX + 36, VIS_PY + 10, VIS_PW - 72, 12, 4, tft.color565(28, 28, 32));
+  tft.drawRoundRect(VIS_PX + 36, VIS_PY + 10, VIS_PW - 72, 12, 4, tft.color565(50, 50, 56));
+  tft.setTextSize(1);
+  tft.setTextColor(colInfoCyan(), tft.color565(28, 28, 32));
+  tft.setCursor(VIS_PX + 48, VIS_PY + 14);
+  tft.print("SPECTRUM");
+  redrawVisualizerBarsOnly();
+}
+
+static unsigned long lastVisAnimMs = 0;
+
+static void updateVisualizerAnimation() {
   if (screenMode != SCREEN_PLAYER) return;
-
   unsigned long now = millis();
-  if (now - lastReelAnimMs < 60) return; // ~16 FPS
-  lastReelAnimMs = now;
+  if (now - lastVisAnimMs < 50) return;
+  lastVisAnimMs = now;
 
-  reelAngleDeg = (reelAngleDeg + 18) % 360; // velocidade da rotação
-
-  drawReelSpokes(PL_REEL_LX, PL_REEL_CY, reelAngleDeg, colReelHub(), colReelRed());
-  drawReelSpokes(PL_REEL_RX, PL_REEL_CY, -reelAngleDeg, colReelHub(), colReelRed());
+  if (playerState != STATE_PLAYING) {
+    for (int i = 0; i < NUM_VIS_BARS; i++) {
+      visBandVal[i] *= 0.82f;
+      visBandEnv[i] *= 0.88f;
+    }
+  } else {
+    computeVisBands();
+  }
+  redrawVisualizerBarsOnly();
 }
 
 // ── Render ─────────────────────────────────────────────────
@@ -861,6 +970,22 @@ static void drawVolumeControls() {
   }
 }
 
+/** Ícone de lista (marcas + linhas) no botão de voltar às pastas. */
+static void drawPlayerListBackIcon() {
+  int bx = PL_BACK_BTN_X, by = PL_BACK_BTN_Y, bw = PL_BACK_BTN_W, bh = PL_BACK_BTN_H;
+  tft.fillRoundRect(bx, by, bw, bh, 4, tft.color565(36, 36, 42));
+  uint16_t fg = colInfoCyan();
+  int cy = by + bh / 2;
+  const int lineW = 30;
+  const int rowGap = 7;
+  int lx0 = bx + 14;
+  for (int row = 0; row < 3; row++) {
+    int ly = cy - 8 + row * rowGap;
+    tft.fillRoundRect(lx0, ly + 1, 4, 4, 1, fg);
+    tft.fillRoundRect(lx0 + 8, ly + 2, lineW, 2, 1, fg);
+  }
+}
+
 static void drawPlayer() {
   tft.fillScreen(COL_BG);
 
@@ -908,15 +1033,7 @@ static void drawPlayer() {
   tft.setCursor(134, 10);
   tft.print("BT");
 
-  tft.fillRoundRect(PL_BACK_BTN_X, PL_BACK_BTN_Y, PL_BACK_BTN_W, PL_BACK_BTN_H, 4, tft.color565(36, 36, 42));
-  tft.setTextSize(2);
-  tft.setTextColor(colInfoCyan(), tft.color565(36, 36, 42));
-  {
-    const char* lbl = "BACK";
-    int lw = (int)strlen(lbl) * 12;
-    tft.setCursor(PL_BACK_BTN_X + (PL_BACK_BTN_W - lw) / 2, PL_BACK_BTN_Y + 7);
-    tft.print(lbl);
-  }
+  drawPlayerListBackIcon();
 
   // ── Título da faixa ─────────────────────────────────────
   char title[64];
@@ -926,36 +1043,8 @@ static void drawPlayer() {
   tft.setTextSize(1);
   drawTitleCentered(PL_TITLE_Y, 220, title);
 
-  // ── Corpo da cassete (visual mais limpo) ────────────────
-  const int casX = 8, casY = PL_CASSETTE_TOP, casW = 224, casH = 108;
-  tft.fillRoundRect(casX, casY, casW, casH, 11, colTapeEdge());
-  tft.fillRoundRect(casX + 4, casY + 4, casW - 8, casH - 8, 8, colTapeBody());
-
-  // Janela principal da fita
-  tft.fillRoundRect(casX + 22, casY + 20, casW - 44, 72, 9, tft.color565(6, 6, 8));
-
-  // Barra superior da etiqueta
-  tft.fillRoundRect(casX + 36, casY + 10, casW - 72, 12, 4, tft.color565(28, 28, 32));
-  tft.drawRoundRect(casX + 36, casY + 10, casW - 72, 12, 4, tft.color565(50, 50, 56));
-
-  // Detalhes laterais discretos (sem textura agressiva)
-  for (int gy = casY + 26; gy <= casY + 82; gy += 12) {
-    tft.fillCircle(casX + 14, gy, 1, tft.color565(22, 22, 26));
-    tft.fillCircle(casX + casW - 14, gy, 1, tft.color565(22, 22, 26));
-  }
-
-  for (int side = 0; side < 2; side++) {
-    int lx = (side == 0) ? PL_REEL_LX : PL_REEL_RX;
-    tft.fillCircle(lx, PL_REEL_CY, 21, colReelRed());
-    tft.fillCircle(lx, PL_REEL_CY, 14, TFT_BLACK);
-    tft.fillCircle(lx, PL_REEL_CY, 11, tft.color565(38, 38, 42));
-  }
-
-  drawReelSpokes(PL_REEL_LX, PL_REEL_CY, reelAngleDeg, colReelHub(), colReelRed());
-  drawReelSpokes(PL_REEL_RX, PL_REEL_CY, -reelAngleDeg, colReelHub(), colReelRed());
-
-  // Faixa central simples para ligar os carretéis (remove listras verdes distorcidas)
-  tft.fillRoundRect(PL_REEL_LX + 14, PL_REEL_CY - 4, (PL_REEL_RX - PL_REEL_LX) - 28, 8, 4, tft.color565(24, 24, 28));
+  // ── Visualizador (barras por banda de frequência) ───────
+  drawVisualizerPanel();
 
   drawPlayerProgressArea();
   drawVolumeControls();
@@ -1060,7 +1149,7 @@ static void handleTouch() {
       drawPlayer();
     }
   } else { // SCREEN_PLAYER
-    // BACK: stop playback and return to browser
+    // Lista: parar e voltar ao browser
     if (ty >= PL_BACK_BTN_Y && ty < PL_BACK_BTN_Y + PL_BACK_BTN_H &&
         tx >= PL_BACK_BTN_X && tx < PL_BACK_BTN_X + PL_BACK_BTN_W) {
       stopTrack();
@@ -1166,6 +1255,9 @@ void loop() {
     }
   }
 
+  if (screenMode == SCREEN_PLAYER)
+    updateVisualizerAnimation();
+
   if (playerState == STATE_PLAYING) {
     bool decoderAlive = false;
     if (currentType == AUDIO_MP3 && mp3) decoderAlive = mp3->isRunning();
@@ -1196,9 +1288,6 @@ void loop() {
         if (screenMode == SCREEN_PLAYER) drawPlayer();
       }
     }
-
-    // Reel animation while playing
-    updateReelAnimation();
   }
 
   handleTouch();
