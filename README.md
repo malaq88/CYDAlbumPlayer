@@ -36,7 +36,7 @@ Clones may use different pins or polarity; adjust `RGB_LED_RED` / `RGB_LED_GREEN
 
 ## Player UI (main playback screen)
 
-The playback view is laid out for a **320×240** landscape panel and is inspired by compact digital audio players (high contrast, minimal chrome).
+The playback view is laid out for a **240×320** portrait panel and is inspired by compact digital audio players (high contrast, minimal chrome).
 
 - **Top bar:** headphone glyph, **track index / total**, **album folder name** (truncated), **BT** badge, decorative battery outline, **BACK** control.
 - **Title line:** current track name (file name without extension), centered above the cassette.
@@ -139,6 +139,43 @@ The code expects:
 
 The project ignores a known Windows folder:
 - `System Volume Information`
+
+**Track order inside an album:** files are sorted **alphabetically by full path** (e.g. `/Album/track01.mp3` before `/Album/track02.mp3`). No ID3/metadata is read for ordering.
+
+## Startup splash (optional high-quality logo)
+
+On boot, after the SD card is mounted, the sketch shows a **WELCOME** screen and either:
+
+1. **Your own logo** from the SD card, or  
+2. A **built-in procedural** GUARA CREW–style drawing (fallback).
+
+### Custom logo file (recommended for a perfect match)
+
+Place a **raw RGB565** file on the SD card root:
+
+- **Path:** `/guara565.raw` (exact name)
+- **Size:** exactly **200 × 218** pixels × 2 bytes = **87 200 bytes**
+- **Format:** row-major, **16-bit RGB565**, **little-endian** per pixel (standard for ESP/TFT_eSPI `pushImage`)
+
+If the file is missing or the size is wrong, the procedural logo is used instead.
+
+You can generate the file with a small Python script (resize your PNG first):
+
+```python
+from PIL import Image
+
+W, H = 200, 218
+img = Image.open("logo.png").convert("RGB").resize((W, H))
+out = bytearray()
+for y in range(H):
+    for x in range(W):
+        r, g, b = img.getpixel((x, y))
+        c = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+        out += bytes((c & 0xFF, c >> 8))  # little-endian
+open("guara565.raw", "wb").write(out)
+```
+
+Copy `guara565.raw` to the root of the SD card.
 
 ## Touch calibration (optional)
 

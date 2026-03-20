@@ -53,15 +53,26 @@ XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
 #define COL_BTN_ACT  tft.color565(70, 70, 70)
 #define COL_DIR      tft.color565(35, 45, 70)
 
-// Player screen (estilo DAP / fita)
-static const int PL_HEADER_H       = 22;
-static const int PL_CASSETTE_TOP   = 40;
-static const int PL_REEL_CY        = 94;
-static const int PL_REEL_LX        = 108;
-static const int PL_REEL_RX        = 212;
-static const int PL_PROGRESS_TOP   = 144;
-static const int PL_PROGRESS_H     = 54;
-static const int PL_TRANSPORT_Y    = 200;
+// Dimensoes em retrato (240x320)
+static const int SCR_W = 240;
+static const int SCR_H = 320;
+
+// Player screen (estilo DAP / fita) - layout retrato
+static const int PL_HEADER_H       = 38;
+static const int PL_TITLE_Y        = 40;  // título da faixa (abaixo da barra)
+static const int PL_CASSETTE_TOP   = 52;
+static const int PL_REEL_CY        = 106;
+static const int PL_REEL_LX        = 72;
+static const int PL_REEL_RX        = 168;
+static const int PL_PROGRESS_TOP   = 164;
+static const int PL_PROGRESS_H     = 56;
+static const int PL_VOLUME_Y       = 224;
+static const int PL_TRANSPORT_Y    = 262;
+// Botão BACK (topo): área de toque explícita
+static const int PL_BACK_BTN_X     = 166;
+static const int PL_BACK_BTN_Y     = 4;
+static const int PL_BACK_BTN_W     = 70;
+static const int PL_BACK_BTN_H     = 30;
 
 static inline uint16_t colReelRed()   { return tft.color565(215, 45, 50); }
 static inline uint16_t colReelHub()   { return tft.color565(160, 160, 165); }
@@ -210,13 +221,13 @@ static int currentTrack = 0;
 enum ScreenMode { SCREEN_BROWSER, SCREEN_PLAYER };
 static ScreenMode screenMode = SCREEN_BROWSER;
 
-static const int browseHeaderH = 26;
-static const int browsePathY = 30;
-static const int browseListY = 44;
-static const int browseFooterH = 30;
+static const int browseHeaderH = 30;
+static const int browsePathY = 34;
+static const int browseListY = 50;
+static const int browseFooterH = 36;
 static const int browseItemH = 24;
 
-static inline int footerY() { return 240 - browseFooterH; }
+static inline int footerY() { return SCR_H - browseFooterH; }
 static inline int visibleSlots() {
   int vis = (footerY() - browseListY) / browseItemH;
   return max(1, vis);
@@ -239,6 +250,21 @@ static void getDisplayName(const char* path, char* out, int maxLen) {
   out[maxLen - 1] = '\0';
   char* dot = strrchr(out, '.');
   if (dot) *dot = '\0';
+}
+
+/** Ordenação alfabética pelo caminho completo (sem ler metadados ID3). */
+static void sortAlbumTracksByPath() {
+  if (albumTrackCount < 2) return;
+  for (int i = 0; i < albumTrackCount - 1; i++) {
+    for (int j = 0; j < albumTrackCount - 1 - i; j++) {
+      if (strcmp(albumTracks[j], albumTracks[j + 1]) > 0) {
+        char tmp[128];
+        memcpy(tmp, albumTracks[j], sizeof(tmp));
+        memcpy(albumTracks[j], albumTracks[j + 1], sizeof(albumTracks[j]));
+        memcpy(albumTracks[j + 1], tmp, sizeof(albumTracks[j + 1]));
+      }
+    }
+  }
 }
 
 /** Duração WAV a partir do cartão (chunks fmt/data); *outRate = sample rate Hz se não for NULL. */
@@ -310,7 +336,7 @@ static void drawTitleCentered(int y, int maxPx, const char* s) {
   }
   tft.setTextSize(1);
   int w = (int)strlen(buf) * charW;
-  tft.setCursor(160 - w / 2, y);
+  tft.setCursor((SCR_W / 2) - w / 2, y);
   tft.setTextColor(COL_TEXT, COL_BG);
   tft.print(buf);
 }
@@ -322,6 +348,13 @@ static unsigned long pauseBeganMs       = 0;
 static uint32_t      cachedDurationSec  = 0;
 static uint32_t      cachedWavRateHz    = 0;
 static unsigned long lastProgressUiMs   = 0;
+static int           volumePercent      = 30;
+
+static void applyVolumePercent() {
+  volumePercent = constrain(volumePercent, 0, 100);
+  if (audioOut) audioOut->gain = (float)volumePercent / 100.0f;
+  a2dp.set_volume((int)((volumePercent * 127) / 100));
+}
 
 static uint32_t clampElapsedSec(uint32_t el) {
   if (cachedDurationSec > 0 && el > cachedDurationSec) return cachedDurationSec;
@@ -399,6 +432,8 @@ static void loadAlbumTracks(const char* albumName) {
     entry.close();
   }
   dir.close();
+
+  sortAlbumTracksByPath();
 }
 
 // ── Audio: stop/start/next/prev ────────────────────────────
@@ -519,10 +554,10 @@ static void updateReelAnimation() {
 // ── Render ─────────────────────────────────────────────────
 static void drawBrowser() {
   tft.fillScreen(COL_BG);
-  tft.fillRect(0, 0, 320, browseHeaderH, COL_BTN);
+  tft.fillRect(0, 0, SCR_W, browseHeaderH, COL_BTN);
 
   tft.setTextColor(COL_TEXT, COL_BTN);
-  tft.setTextSize(2);
+  tft.setTextSize(1);
   tft.setCursor(10, 4);
   tft.print("Albums");
 
@@ -530,14 +565,19 @@ static void drawBrowser() {
   uint16_t btCol = btConnected ? COL_ACCENT : TFT_RED;
   tft.setTextSize(1);
   // "BT" badge
-  tft.fillRoundRect(212, 5, 26, 16, 4, btCol);
+  tft.fillRoundRect(150, 7, 26, 14, 4, btCol);
   tft.setTextColor(COL_BG, btCol);
-  tft.setCursor(219, 9);
+  tft.setCursor(157, 10);
   tft.print("BT");
 
   tft.setTextColor(btCol, COL_BTN);
-  tft.setCursor(242, 9);
-  if (btConnected) tft.print(BT_SPEAKER_NAME);
+  tft.setCursor(180, 10);
+  if (btConnected) {
+    char bname[10];
+    strncpy(bname, BT_SPEAKER_NAME, sizeof(bname) - 1);
+    bname[sizeof(bname) - 1] = '\0';
+    tft.print(bname);
+  }
   else              tft.print("BT..");
 
   tft.setTextColor(COL_DIM, COL_BG);
@@ -548,12 +588,12 @@ static void drawBrowser() {
   int fY = footerY();
   int vis = visibleSlots();
 
-  tft.fillRoundRect(8, fY + 4, 70, 22, 5, COL_BTN);
-  tft.fillRoundRect(242, fY + 4, 70, 22, 5, COL_BTN);
+  tft.fillRoundRect(8, fY + 6, 58, 24, 5, COL_BTN);
+  tft.fillRoundRect(174, fY + 6, 58, 24, 5, COL_BTN);
   tft.setTextColor(COL_TEXT, COL_BTN);
-  tft.setCursor(25, fY + 11);
+  tft.setCursor(20, fY + 15);
   tft.print("PREV");
-  tft.setCursor(262, fY + 11);
+  tft.setCursor(186, fY + 15);
   tft.print("NEXT");
 
   int totalPages = (albumCount + vis - 1) / vis;
@@ -561,14 +601,14 @@ static void drawBrowser() {
   int page = (albumScroll / vis) + 1;
   if (page > totalPages) page = totalPages;
   tft.setTextColor(COL_DIM, COL_BG);
-  tft.setCursor(132, fY + 11);
+  tft.setCursor(104, fY + 15);
   tft.printf("%d/%d", page, totalPages);
 
   for (int i = 0; i < vis; i++) {
     int idx = albumScroll + i;
     if (idx >= albumCount) break;
     int y = browseListY + i * browseItemH;
-    tft.fillRoundRect(6, y + 1, 308, browseItemH - 3, 5, COL_DIR);
+    tft.fillRoundRect(6, y + 1, SCR_W - 12, browseItemH - 3, 5, COL_DIR);
     tft.setTextColor(COL_TEXT, COL_DIR);
     tft.setTextSize(1);
     tft.setCursor(12, y + 7);
@@ -576,12 +616,174 @@ static void drawBrowser() {
   }
 }
 
+// ── Splash / tela inicial ─────────────────────────────────
+// Opcional: imagem perfeita a partir do SD — ficheiro RAW RGB565 little-endian, exatamente SP_RAW_W*SP_RAW_H*2 bytes.
+static const char* const SPLASH_RAW_PATH = "/guara565.raw";
+static const int SP_RAW_W = 200;
+static const int SP_RAW_H = 218;
+
+static inline void splashDrawPlus(int x, int y, uint16_t c) {
+  tft.drawFastVLine(x, y - 2, 5, c);
+  tft.drawFastHLine(x - 2, y, 5, c);
+}
+
+/** Tenta desenhar o logo a partir do cartão (qualidade máxima). */
+static bool tryDrawSplashFromSD(int dstX, int dstY) {
+  File f = SD.open(SPLASH_RAW_PATH, FILE_READ);
+  if (!f) return false;
+  long need = (long)SP_RAW_W * (long)SP_RAW_H * 2L;
+  if (f.size() != need) {
+    f.close();
+    return false;
+  }
+  uint16_t line[SP_RAW_W];
+  for (int y = 0; y < SP_RAW_H; y++) {
+    if (f.read((uint8_t*)line, SP_RAW_W * 2) != (size_t)(SP_RAW_W * 2)) {
+      f.close();
+      return false;
+    }
+    tft.pushImage(dstX, dstY + y, SP_RAW_W, 1, line);
+  }
+  f.close();
+  return true;
+}
+
+/** Logo GUARA CREW desenhada (fallback) — estilo monocromático / pixel-art. */
+static void drawGuaraLogoProcedural(int ix, int iy, int iw, int ih) {
+  tft.fillRect(ix, iy, iw, ih, COL_BG);
+
+  const int cx = ix + iw / 2;
+  uint16_t furHi = tft.color565(210, 210, 218);
+  uint16_t furMid = tft.color565(165, 165, 175);
+  uint16_t furLo = tft.color565(118, 118, 128);
+  uint16_t sunHi = tft.color565(62, 62, 70);
+  uint16_t sunLo = tft.color565(44, 44, 52);
+  uint16_t accPurp = tft.color565(170, 80, 240);
+
+  // “Sol” em meia-lua com scanlines (cordas horizontais)
+  {
+    const int syc = iy + 72;
+    const int R = 58;
+    for (int dy = -R; dy <= 0; dy++) {
+      int rr = R * R - dy * dy;
+      if (rr < 0) continue;
+      int ww = (int)sqrtf((float)rr);
+      uint16_t c = ((dy + R) & 2) ? sunHi : sunLo;
+      tft.drawFastHLine(cx - ww, syc + dy, 2 * ww + 1, c);
+    }
+  }
+
+  // Orelhas altas + pelagem
+  tft.fillTriangle(cx - 54, iy + 118, cx - 26, iy + 52, cx - 10, iy + 108, furHi);
+  tft.fillTriangle(cx + 54, iy + 118, cx + 26, iy + 52, cx + 10, iy + 108, furHi);
+  tft.fillTriangle(cx - 50, iy + 122, cx + 50, iy + 122, cx, iy + 198, furHi);
+
+  // Sombra lateral (volume do focinho)
+  tft.fillTriangle(cx - 46, iy + 128, cx - 8, iy + 128, cx - 28, iy + 188, furMid);
+  tft.fillTriangle(cx + 46, iy + 128, cx + 8, iy + 128, cx + 28, iy + 188, furMid);
+
+  // Máscara escura em volta dos olhos
+  tft.fillCircle(cx - 22, iy + 118, 10, furLo);
+  tft.fillCircle(cx + 22, iy + 118, 10, furLo);
+
+  // Focinho claro
+  tft.fillTriangle(cx - 18, iy + 138, cx + 18, iy + 138, cx, iy + 186, furMid);
+  tft.fillTriangle(cx - 12, iy + 144, cx + 12, iy + 144, cx, iy + 178, furHi);
+
+  // Olhos
+  tft.fillCircle(cx - 22, iy + 116, 4, COL_TEXT);
+  tft.fillCircle(cx + 22, iy + 116, 4, COL_TEXT);
+  tft.fillCircle(cx - 23, iy + 115, 2, COL_BG);
+  tft.fillCircle(cx + 21, iy + 115, 2, COL_BG);
+
+  // Nariz
+  tft.fillTriangle(cx - 5, iy + 158, cx + 5, iy + 158, cx, iy + 168, COL_BG);
+
+  // Bigodes / detalhe pixel
+  for (int k = 0; k < 4; k++) {
+    tft.drawFastHLine(cx - 34 - k * 3, iy + 152 + k, 10, furLo);
+    tft.drawFastHLine(cx + 24 + k * 3, iy + 152 + k, 10, furLo);
+  }
+
+  // Cruzes decorativas (estética “glitch” suave)
+  uint16_t xcol = tft.color565(90, 90, 98);
+  splashDrawPlus(ix + 8, iy + 56, xcol);
+  splashDrawPlus(ix + 14, iy + 92, COL_DIM);
+  splashDrawPlus(ix + iw - 9, iy + 64, xcol);
+  splashDrawPlus(ix + iw - 15, iy + 100, COL_DIM);
+  splashDrawPlus(cx - 70, iy + 40, COL_DIM);
+  splashDrawPlus(cx + 70, iy + 44, COL_DIM);
+
+  // Escudo GUARA (trapézio simulado + sombra)
+  {
+    const int bx = ix + 14, by = iy + 168, bw = iw - 28, bh = 44;
+    tft.fillTriangle(bx, by + bh, bx + 8, by, bx + bw - 8, by, furHi);
+    tft.fillTriangle(bx, by + bh, bx + bw - 8, by, bx + bw, by + bh, furHi);
+    tft.drawTriangle(bx, by + bh, bx + 8, by, bx + bw - 8, by, accPurp);
+    tft.drawTriangle(bx, by + bh, bx + bw - 8, by, bx + bw, by + bh, accPurp);
+    tft.setTextColor(COL_BG, furHi);
+    tft.setTextSize(2);
+    const char* g = "GUARA";
+    int gw = (int)strlen(g) * 12;
+    tft.setCursor(cx - gw / 2, by + 14);
+    tft.print(g);
+  }
+
+  // Faixa CREW
+  {
+    const int bx2 = ix + 44, by2 = iy + 214, bw2 = iw - 88, bh2 = 28;
+    tft.fillRoundRect(bx2, by2, bw2, bh2, 5, furHi);
+    tft.drawRoundRect(bx2, by2, bw2, bh2, 5, accPurp);
+    tft.setTextColor(COL_BG, furHi);
+    tft.setTextSize(2);
+    const char* c = "CREW";
+    int cw = (int)strlen(c) * 12;
+    tft.setCursor(cx - cw / 2, by2 + 8);
+    tft.print(c);
+  }
+}
+
+static void drawStartupScreen() {
+  tft.fillScreen(COL_BG);
+
+  tft.setTextSize(2);
+  tft.setTextColor(COL_TEXT, COL_BG);
+  const char* wel = "WELCOME";
+  int welW = (int)strlen(wel) * 12;
+  tft.setCursor((SCR_W - welW) / 2, 8);
+  tft.print(wel);
+
+  const int lx = 12, ly = 40, lw = 216, lh = 258;
+  uint16_t frameOut = tft.color565(48, 48, 56);
+  uint16_t frameIn = tft.color565(28, 28, 34);
+  tft.drawRoundRect(lx, ly, lw, lh, 10, frameOut);
+  tft.drawRoundRect(lx + 2, ly + 2, lw - 4, lh - 4, 8, frameIn);
+  tft.drawFastHLine(lx + 16, ly + 6, lw - 32, tft.color565(170, 80, 240));
+
+  const int innerX = lx + 6;
+  const int innerY = ly + 6;
+  const int innerW = lw - 12;
+  const int innerH = lh - 12;
+
+  // Posição centrada para o RAW fixo 200x218
+  const int rawX = innerX + (innerW - SP_RAW_W) / 2;
+  const int rawY = innerY + (innerH - SP_RAW_H) / 2;
+
+  if (!tryDrawSplashFromSD(rawX, rawY))
+    drawGuaraLogoProcedural(innerX, innerY, innerW, innerH);
+
+  tft.setTextSize(1);
+  tft.setTextColor(COL_DIM, COL_BG);
+  tft.setCursor(48, 306);
+  tft.print("BT connecting...");
+}
+
 /** Barra de progresso, tempos e metadados técnicos (atualização periódica no loop). */
 static void drawPlayerProgressArea() {
   if (screenMode != SCREEN_PLAYER) return;
 
   const int y0 = PL_PROGRESS_TOP;
-  tft.fillRect(0, y0, 320, PL_PROGRESS_H, COL_BG);
+  tft.fillRect(0, y0, SCR_W, PL_PROGRESS_H, COL_BG);
 
   uint32_t el = elapsedPlaybackSec();
   char tEl[16], tTot[16];
@@ -592,7 +794,7 @@ static void drawPlayerProgressArea() {
     tTot[sizeof(tTot) - 1] = '\0';
   }
 
-  const int bx = 10, by = y0 + 2, bw = 300, bh = 6;
+  const int bx = 10, by = y0 + 2, bw = SCR_W - 20, bh = 6;
   tft.drawRoundRect(bx, by, bw, bh + 2, 2, COL_DIM);
   tft.fillRect(bx + 1, by + 1, bw - 2, bh, tft.color565(22, 22, 26));
   if (cachedDurationSec > 0) {
@@ -611,7 +813,7 @@ static void drawPlayerProgressArea() {
   }
   tft.setCursor(22, y0 + 16);
   tft.print(tEl);
-  tft.setCursor(232, y0 + 16);
+  tft.setCursor(SCR_W - 70, y0 + 16);
   tft.print(tTot);
 
   tft.setTextColor(COL_DIM, COL_BG);
@@ -628,20 +830,55 @@ static void drawPlayerProgressArea() {
     tft.print("---");
 }
 
+static void drawVolumeControls() {
+  const int y = PL_VOLUME_Y;
+  tft.fillRoundRect(10, y, 56, 30, 6, COL_BTN);
+  tft.fillRoundRect(74, y, 92, 30, 6, COL_BTN);
+  tft.fillRoundRect(174, y, 56, 30, 6, COL_BTN);
+
+  uint16_t fg = COL_TEXT;
+  const int cy = y + 15;
+
+  // Ícone “−” (barra espessa, estilo transporte)
+  {
+    const int cx = 10 + 56 / 2;
+    tft.fillRoundRect(cx - 10, cy - 3, 20, 6, 2, fg);
+  }
+
+  char vbuf[10];
+  snprintf(vbuf, sizeof(vbuf), "%d%%", volumePercent);
+  tft.setTextSize(1);
+  tft.setTextColor(COL_TEXT, COL_BTN);
+  int tw = (int)strlen(vbuf) * 6;
+  tft.setCursor((SCR_W / 2) - (tw / 2), y + 11);
+  tft.print(vbuf);
+
+  // Ícone “+” (cruz com traços espessos)
+  {
+    const int cx = 174 + 56 / 2;
+    tft.fillRoundRect(cx - 2, cy - 10, 4, 20, 1, fg);
+    tft.fillRoundRect(cx - 10, cy - 2, 20, 4, 2, fg);
+  }
+}
+
 static void drawPlayer() {
   tft.fillScreen(COL_BG);
 
   // ── Barra de estado (estilo DAP) ─────────────────────────
-  tft.fillRect(0, 0, 320, PL_HEADER_H, colTopBarBg());
-  tft.drawFastHLine(0, PL_HEADER_H - 1, 320, tft.color565(40, 40, 48));
+  tft.fillRect(0, 0, SCR_W, PL_HEADER_H, colTopBarBg());
+  tft.drawFastHLine(0, PL_HEADER_H - 1, SCR_W, tft.color565(40, 40, 48));
 
-  tft.drawRoundRect(4, 4, 11, 13, 2, COL_DIM);
-  tft.drawFastVLine(15, 8, 6, COL_TEXT);
-  tft.drawFastHLine(15, 8, 4, COL_TEXT);
+  // Ícone de nota musical (roxo)
+  uint16_t noteCol = tft.color565(170, 80, 240);
+  tft.fillCircle(9, 17, 3, noteCol);
+  tft.fillCircle(17, 15, 3, noteCol);
+  tft.fillRect(11, 8, 3, 11, noteCol);
+  tft.fillRect(19, 6, 3, 11, noteCol);
+  tft.drawFastHLine(12, 6, 8, noteCol);
 
   tft.setTextColor(COL_TEXT, colTopBarBg());
-  tft.setTextSize(1);
-  tft.setCursor(22, 7);
+  tft.setTextSize(2);
+  tft.setCursor(22, 8);
   if (albumTrackCount > 0) tft.printf("%d/%d", currentTrack + 1, albumTrackCount);
   else tft.print("-/-");
 
@@ -655,43 +892,57 @@ static void drawPlayer() {
       abuf[mc] = '\0';
       strcat(abuf, "..");
     }
-    tft.setCursor(72, 7);
+    if ((int)strlen(abuf) > 14) {
+      abuf[14] = '\0';
+      strcat(abuf, "..");
+    }
+    tft.setTextSize(1);
+    tft.setCursor(22, 26);
     tft.print(abuf);
   }
 
   uint16_t btCol = a2dp.is_connected() ? tft.color565(60, 200, 90) : tft.color565(200, 60, 60);
-  tft.fillRoundRect(196, 4, 26, 14, 3, tft.color565(30, 30, 34));
+  tft.fillRoundRect(128, 6, 32, 16, 3, tft.color565(30, 30, 34));
+  tft.setTextSize(1);
   tft.setTextColor(btCol, colTopBarBg());
-  tft.setCursor(202, 8);
-  tft.print(BT_SPEAKER_NAME);
+  tft.setCursor(134, 10);
+  tft.print("BT");
 
-  tft.drawRect(228, 6, 20, 11, COL_DIM);
-  tft.fillRect(230, 8, 14, 7, tft.color565(70, 140, 80));
-
-  tft.fillRoundRect(256, 3, 60, 16, 3, tft.color565(36, 36, 42));
+  tft.fillRoundRect(PL_BACK_BTN_X, PL_BACK_BTN_Y, PL_BACK_BTN_W, PL_BACK_BTN_H, 4, tft.color565(36, 36, 42));
+  tft.setTextSize(2);
   tft.setTextColor(colInfoCyan(), tft.color565(36, 36, 42));
-  tft.setCursor(266, 8);
-  tft.print("BACK");
+  {
+    const char* lbl = "BACK";
+    int lw = (int)strlen(lbl) * 12;
+    tft.setCursor(PL_BACK_BTN_X + (PL_BACK_BTN_W - lw) / 2, PL_BACK_BTN_Y + 7);
+    tft.print(lbl);
+  }
 
   // ── Título da faixa ─────────────────────────────────────
   char title[64];
   if (albumTrackCount > 0) getDisplayName(albumTracks[currentTrack], title, sizeof(title));
   else strncpy(title, "Sem faixa", sizeof(title) - 1);
   title[sizeof(title) - 1] = '\0';
-  drawTitleCentered(24, 300, title);
+  tft.setTextSize(1);
+  drawTitleCentered(PL_TITLE_Y, 220, title);
 
-  // ── Corpo da cassetes / fita ────────────────────────────
-  tft.fillRoundRect(10, PL_CASSETTE_TOP, 300, 98, 11, colTapeEdge());
-  tft.fillRoundRect(14, PL_CASSETTE_TOP + 4, 292, 90, 8, colTapeBody());
+  // ── Corpo da cassete (visual mais limpo) ────────────────
+  const int casX = 8, casY = PL_CASSETTE_TOP, casW = 224, casH = 108;
+  tft.fillRoundRect(casX, casY, casW, casH, 11, colTapeEdge());
+  tft.fillRoundRect(casX + 4, casY + 4, casW - 8, casH - 8, 8, colTapeBody());
 
-  for (int gx = 22; gx <= 40; gx += 6) {
-    for (int gy = PL_CASSETTE_TOP + 18; gy <= PL_CASSETTE_TOP + 84; gy += 10) {
-      tft.fillCircle(gx, gy, 1, tft.color565(18, 18, 22));
-      tft.fillCircle(320 - gx, gy, 1, tft.color565(18, 18, 22));
-    }
+  // Janela principal da fita
+  tft.fillRoundRect(casX + 22, casY + 20, casW - 44, 72, 9, tft.color565(6, 6, 8));
+
+  // Barra superior da etiqueta
+  tft.fillRoundRect(casX + 36, casY + 10, casW - 72, 12, 4, tft.color565(28, 28, 32));
+  tft.drawRoundRect(casX + 36, casY + 10, casW - 72, 12, 4, tft.color565(50, 50, 56));
+
+  // Detalhes laterais discretos (sem textura agressiva)
+  for (int gy = casY + 26; gy <= casY + 82; gy += 12) {
+    tft.fillCircle(casX + 14, gy, 1, tft.color565(22, 22, 26));
+    tft.fillCircle(casX + casW - 14, gy, 1, tft.color565(22, 22, 26));
   }
-
-  tft.fillRoundRect(44, PL_CASSETTE_TOP + 16, 232, 70, 9, tft.color565(4, 4, 6));
 
   for (int side = 0; side < 2; side++) {
     int lx = (side == 0) ? PL_REEL_LX : PL_REEL_RX;
@@ -703,33 +954,30 @@ static void drawPlayer() {
   drawReelSpokes(PL_REEL_LX, PL_REEL_CY, reelAngleDeg, colReelHub(), colReelRed());
   drawReelSpokes(PL_REEL_RX, PL_REEL_CY, -reelAngleDeg, colReelHub(), colReelRed());
 
-  uint16_t tapeLine = tft.color565(35, 150, 95);
-  for (int i = 0; i < 16; i++) {
-    int x1 = 58 + i * 5;
-    int y1 = PL_CASSETTE_TOP + 22 + i;
-    tft.drawLine(x1, y1, x1 + 18, y1 + 11, tapeLine);
-  }
+  // Faixa central simples para ligar os carretéis (remove listras verdes distorcidas)
+  tft.fillRoundRect(PL_REEL_LX + 14, PL_REEL_CY - 4, (PL_REEL_RX - PL_REEL_LX) - 28, 8, 4, tft.color565(24, 24, 28));
 
   drawPlayerProgressArea();
+  drawVolumeControls();
   lastProgressUiMs = millis();
 
   // ── Transporte ───────────────────────────────────────────
   const int y = PL_TRANSPORT_Y;
-  tft.fillRoundRect(10, y, 70, 38, 7, COL_BTN);
-  tft.fillRoundRect(90, y, 140, 38, 7, COL_BTN);
-  tft.fillRoundRect(240, y, 70, 38, 7, COL_BTN);
+  tft.fillRoundRect(10, y, 56, 42, 7, COL_BTN);
+  tft.fillRoundRect(74, y, 92, 42, 7, COL_BTN);
+  tft.fillRoundRect(174, y, 56, 42, 7, COL_BTN);
 
   uint16_t fg = COL_TEXT;
-  int cy = y + 38 / 2;
+  int cy = y + 42 / 2;
 
   {
-    int cxPrev = 10 + 70 / 2;
+    int cxPrev = 10 + 56 / 2;
     tft.fillRect(cxPrev - 18, cy - 14, 3, 28, fg);
     tft.fillTriangle(cxPrev - 2, cy, cxPrev - 2 + 11, cy - 11, cxPrev - 2 + 11, cy + 11, fg);
     tft.fillTriangle(cxPrev + 8, cy, cxPrev + 8 + 11, cy - 11, cxPrev + 8 + 11, cy + 11, fg);
   }
   {
-    int cxPlay = 90 + 140 / 2;
+    int cxPlay = 74 + 92 / 2;
     if (playerState == STATE_PLAYING) {
       int wBar = 7;
       int gap = 5;
@@ -743,7 +991,7 @@ static void drawPlayer() {
     }
   }
   {
-    int cxNext = 240 + 70 / 2;
+    int cxNext = 174 + 56 / 2;
     tft.fillTriangle(cxNext - 10 - 11, cy - 11, cxNext - 10 - 11, cy + 11, cxNext - 10, cy, fg);
     tft.fillTriangle(cxNext - 2 - 11, cy - 11, cxNext - 2 - 11, cy + 11, cxNext - 2, cy, fg);
     tft.fillRect(cxNext + 7, cy - 14, 3, 28, fg);
@@ -754,10 +1002,10 @@ static void drawPlayer() {
 static bool getTouchXY(int16_t &tx, int16_t &ty) {
   if (!ts.touched()) return false;
   TS_Point p = ts.getPoint();
-  tx = map(p.x, TS_MINX, TS_MAXX, 0, 320);
-  ty = map(p.y, TS_MINY, TS_MAXY, 0, 240);
-  tx = constrain(tx, 0, 319);
-  ty = constrain(ty, 0, 239);
+  tx = map(p.x, TS_MINX, TS_MAXX, 0, SCR_W);
+  ty = map(p.y, TS_MINY, TS_MAXY, 0, SCR_H);
+  tx = constrain(tx, 0, SCR_W - 1);
+  ty = constrain(ty, 0, SCR_H - 1);
   return true;
 }
 
@@ -775,16 +1023,16 @@ static void handleTouch() {
     int fY = footerY();
     int vis = visibleSlots();
     int btnY0 = fY;                 // altura total do rodapé (tolerante)
-    int btnY1 = fY + browseFooterH; // 240-browseFooterH ... 239
+    int btnY1 = fY + browseFooterH; // SCR_H-browseFooterH ... SCR_H-1
 
     // PREV
-    if (ty >= btnY0 && ty <= btnY1 && tx >= 0 && tx <= 90) {
+    if (ty >= btnY0 && ty <= btnY1 && tx >= 0 && tx <= 72) {
       albumScroll = max(0, albumScroll - vis);
       drawBrowser();
       return;
     }
     // NEXT
-    if (ty >= btnY0 && ty <= btnY1 && tx >= 230 && tx <= 320) {
+    if (ty >= btnY0 && ty <= btnY1 && tx >= 168 && tx <= SCR_W) {
       if (albumScroll + vis < albumCount) albumScroll += vis;
       drawBrowser();
       return;
@@ -802,7 +1050,7 @@ static void handleTouch() {
 
     // visual feedback
     int y = browseListY + indexInView * browseItemH;
-    tft.fillRoundRect(6, y + 1, 308, browseItemH - 3, 5, COL_BTN_ACT);
+    tft.fillRoundRect(6, y + 1, SCR_W - 12, browseItemH - 3, 5, COL_BTN_ACT);
     delay(60);
 
     loadAlbumTracks(albums[idx]);
@@ -813,18 +1061,34 @@ static void handleTouch() {
     }
   } else { // SCREEN_PLAYER
     // BACK: stop playback and return to browser
-    if (ty < PL_HEADER_H && tx >= 256) {
+    if (ty >= PL_BACK_BTN_Y && ty < PL_BACK_BTN_Y + PL_BACK_BTN_H &&
+        tx >= PL_BACK_BTN_X && tx < PL_BACK_BTN_X + PL_BACK_BTN_W) {
       stopTrack();
       screenMode = SCREEN_BROWSER;
       drawBrowser();
       return;
     }
 
+    // volume row (10% por toque)
+    if (ty >= PL_VOLUME_Y && ty <= PL_VOLUME_Y + 32) {
+      if (tx < 68) {
+        volumePercent -= 10;
+        applyVolumePercent();
+        drawVolumeControls();
+        return;
+      } else if (tx >= 172) {
+        volumePercent += 10;
+        applyVolumePercent();
+        drawVolumeControls();
+        return;
+      }
+    }
+
     // controls (center area)
     int y = PL_TRANSPORT_Y;
-    if (ty >= y && ty <= y + 40) {
-      if (tx < 80) prevTrack();
-      else if (tx < 230) togglePause();
+    if (ty >= y && ty <= y + 44) {
+      if (tx < 68) prevTrack();
+      else if (tx < 172) togglePause();
       else nextTrack();
       drawPlayer();
     }
@@ -849,13 +1113,13 @@ void setup() {
   delay(120);
   tft.writecommand(0x26);
   tft.writedata(1);
-  tft.setRotation(1);
+  tft.setRotation(0);
   tft.fillScreen(COL_BG);
 
   SPI.begin();
   touchSPI.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
   ts.begin(touchSPI);
-  ts.setRotation(1);
+  ts.setRotation(0);
 
   if (!SD.begin(SD_CS)) {
     tft.setTextColor(TFT_RED, COL_BG);
@@ -867,11 +1131,9 @@ void setup() {
 
   audioOut = new RingBufOutput();
   audioOut->gain = 0.7f;
+  applyVolumePercent();
 
-  tft.setTextColor(COL_DIM, COL_BG);
-  tft.setTextSize(1);
-  tft.setCursor(20, 75);
-  tft.print("BT connecting...");
+  drawStartupScreen();
 
   a2dp.set_auto_reconnect(true);
   a2dp.set_volume(127);
