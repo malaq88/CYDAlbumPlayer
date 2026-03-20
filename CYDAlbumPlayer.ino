@@ -156,6 +156,20 @@ static AudioType currentType = AUDIO_NONE;
 enum PlayerState { STATE_STOPPED, STATE_PLAYING, STATE_PAUSED };
 static PlayerState playerState = STATE_STOPPED;
 
+/** Enche o ring buffer durante TFT/SD/delay (evita underrun A2DP ao mudar de ecrã ou álbum). */
+static void audioPumpPlayingMax(int maxLoops) {
+  if (playerState != STATE_PLAYING) return;
+  const int target = (RING_SIZE * 3) / 4;
+  int loops = 0;
+  while ((int)rbAvail() < target && loops < maxLoops) {
+    bool ok = false;
+    if (currentType == AUDIO_MP3 && mp3 && mp3->isRunning()) ok = mp3->loop();
+    else if (currentType == AUDIO_WAV && wav && wav->isRunning()) ok = wav->loop();
+    if (!ok) break;
+    loops++;
+  }
+}
+
 // ── LED RGB traseiro (estado Bluetooth / reprodução) ─────
 static unsigned long rgbLastMs = 0;
 static bool rgbBlinkPhase = false;
@@ -239,6 +253,11 @@ static const int browsePathY = 34;
 static const int browseListY = 50;
 static const int browseFooterH = 36;
 static const int browseItemH = 24;
+// Botão "Leitor" no browser: volta ao ecrã de reprodução (música continua)
+static const int BROWSE_PLAYER_BTN_X = 72;
+static const int BROWSE_PLAYER_BTN_Y = 4;
+static const int BROWSE_PLAYER_BTN_W = 72;
+static const int BROWSE_PLAYER_BTN_H = 22;
 
 static inline int footerY() { return SCR_H - browseFooterH; }
 static inline int visibleSlots() {
@@ -268,6 +287,7 @@ static void getDisplayName(const char* path, char* out, int maxLen) {
 /** Ordenação alfabética pelo caminho completo (sem ler metadados ID3). */
 static void sortAlbumTracksByPath() {
   if (albumTrackCount < 2) return;
+  int sortPump = 0;
   for (int i = 0; i < albumTrackCount - 1; i++) {
     for (int j = 0; j < albumTrackCount - 1 - i; j++) {
       if (strcmp(albumTracks[j], albumTracks[j + 1]) > 0) {
@@ -276,6 +296,7 @@ static void sortAlbumTracksByPath() {
         memcpy(albumTracks[j], albumTracks[j + 1], sizeof(albumTracks[j]));
         memcpy(albumTracks[j + 1], tmp, sizeof(albumTracks[j + 1]));
       }
+      if ((++sortPump & 7) == 0) audioPumpPlayingMax(48);
     }
   }
 }
@@ -294,7 +315,9 @@ static uint32_t wavParseDurationAndRate(const char* path, uint32_t* outRate) {
   uint32_t sampleRate = 0, dataSize = 0;
   bool haveData = false;
 
+  int wavPump = 0;
   while (f.available()) {
+    if ((++wavPump & 3) == 0) audioPumpPlayingMax(32);
     uint8_t cid[4], szb[4];
     if (f.read(cid, 4) < 4 || f.read(szb, 4) < 4) break;
     uint32_t chunkSize = (uint32_t)szb[0] | ((uint32_t)szb[1] << 8) | ((uint32_t)szb[2] << 16) | ((uint32_t)szb[3] << 24);
@@ -427,6 +450,7 @@ static void loadAlbumTracks(const char* albumName) {
   File dir = SD.open(dirPath);
   if (!dir || !dir.isDirectory()) return;
 
+  int dirPump = 0;
   while (true) {
     File entry = dir.openNextFile();
     if (!entry) break;
@@ -443,6 +467,7 @@ static void loadAlbumTracks(const char* albumName) {
       }
     }
     entry.close();
+    if ((++dirPump & 2) == 0) audioPumpPlayingMax(72);
   }
   dir.close();
 
@@ -689,6 +714,19 @@ static void drawBrowser() {
   }
   else              tft.print("BT..");
 
+  if (albumTrackCount > 0) {
+    int bx = BROWSE_PLAYER_BTN_X, by = BROWSE_PLAYER_BTN_Y, bw = BROWSE_PLAYER_BTN_W, bh = BROWSE_PLAYER_BTN_H;
+    tft.fillRoundRect(bx, by, bw, bh, 4, COL_BTN);
+    uint16_t acc = colInfoCyan();
+    int cx = bx + 12;
+    int cy = by + bh / 2;
+    tft.fillTriangle(cx - 4, cy - 5, cx - 4, cy + 5, cx + 6, cy, acc);
+    tft.setTextColor(COL_TEXT, COL_BTN);
+    tft.setTextSize(1);
+    tft.setCursor(bx + 22, by + 8);
+    tft.print("Leitor");
+  }
+
   tft.setTextColor(COL_DIM, COL_BG);
   tft.setTextSize(1);
   tft.setCursor(10, browsePathY);
@@ -722,7 +760,9 @@ static void drawBrowser() {
     tft.setTextSize(1);
     tft.setCursor(12, y + 7);
     tft.print(albums[idx]);
+    if ((i & 1) == 0) audioPumpPlayingMax(48);
   }
+  audioPumpPlayingMax(384);
 }
 
 // ── Splash / tela inicial ─────────────────────────────────
@@ -1034,6 +1074,7 @@ static void drawPlayer() {
   tft.print("BT");
 
   drawPlayerListBackIcon();
+  audioPumpPlayingMax(160);
 
   // ── Título da faixa ─────────────────────────────────────
   char title[64];
@@ -1045,10 +1086,12 @@ static void drawPlayer() {
 
   // ── Visualizador (barras por banda de frequência) ───────
   drawVisualizerPanel();
+  audioPumpPlayingMax(220);
 
   drawPlayerProgressArea();
   drawVolumeControls();
   lastProgressUiMs = millis();
+  audioPumpPlayingMax(220);
 
   // ── Transporte ───────────────────────────────────────────
   const int y = PL_TRANSPORT_Y;
@@ -1085,6 +1128,7 @@ static void drawPlayer() {
     tft.fillTriangle(cxNext - 2 - 11, cy - 11, cxNext - 2 - 11, cy + 11, cxNext - 2, cy, fg);
     tft.fillRect(cxNext + 7, cy - 14, 3, 28, fg);
   }
+  audioPumpPlayingMax(320);
 }
 
 // ── Touch ─────────────────────────────────────────────────
@@ -1106,9 +1150,24 @@ static void handleTouch() {
   if (now - lastTouchTime < TOUCH_DEBOUNCE_MS) return;
   lastTouchTime = now;
 
-  while (ts.touched()) delay(10);
+  {
+    unsigned long rel = millis();
+    while (ts.touched()) {
+      audioPumpPlayingMax(120);
+      if (millis() - rel > 500) break;
+      delay(1);
+    }
+  }
 
   if (screenMode == SCREEN_BROWSER) {
+    if (albumTrackCount > 0 &&
+        ty >= BROWSE_PLAYER_BTN_Y && ty < BROWSE_PLAYER_BTN_Y + BROWSE_PLAYER_BTN_H &&
+        tx >= BROWSE_PLAYER_BTN_X && tx < BROWSE_PLAYER_BTN_X + BROWSE_PLAYER_BTN_W) {
+      screenMode = SCREEN_PLAYER;
+      drawPlayer();
+      return;
+    }
+
     int fY = footerY();
     int vis = visibleSlots();
     int btnY0 = fY;                 // altura total do rodapé (tolerante)
@@ -1137,10 +1196,16 @@ static void handleTouch() {
     int idx = albumScroll + indexInView;
     if (idx < 0 || idx >= albumCount) return;
 
-    // visual feedback
+    // visual feedback (reabastecer áudio durante a pausa — evita buraco no BT)
     int y = browseListY + indexInView * browseItemH;
     tft.fillRoundRect(6, y + 1, SCR_W - 12, browseItemH - 3, 5, COL_BTN_ACT);
-    delay(60);
+    {
+      unsigned long t0 = millis();
+      while (millis() - t0 < 50) audioPumpPlayingMax(200);
+    }
+
+    // Parar decode antes de ler o novo álbum no SD — evita SPI/cartão partilhado com MP3 a tocar
+    if (playerState != STATE_STOPPED) stopTrack();
 
     loadAlbumTracks(albums[idx]);
     if (albumTrackCount > 0) {
@@ -1149,12 +1214,12 @@ static void handleTouch() {
       drawPlayer();
     }
   } else { // SCREEN_PLAYER
-    // Lista: parar e voltar ao browser
+    // Lista: volta às pastas; a música continua a tocar
     if (ty >= PL_BACK_BTN_Y && ty < PL_BACK_BTN_Y + PL_BACK_BTN_H &&
         tx >= PL_BACK_BTN_X && tx < PL_BACK_BTN_X + PL_BACK_BTN_W) {
-      stopTrack();
       screenMode = SCREEN_BROWSER;
       drawBrowser();
+      audioPumpPlayingMax(512);
       return;
     }
 

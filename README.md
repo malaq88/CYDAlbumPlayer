@@ -38,7 +38,7 @@ Clones may use different pins or polarity; adjust `RGB_LED_RED` / `RGB_LED_GREEN
 
 The playback view is laid out for a **240×320** portrait panel and is inspired by compact digital audio players (high contrast, minimal chrome).
 
-- **Top bar:** note icon, **track index / total**, **album folder name** (truncated), **BT** badge, **list icon** (top-right) to return to folders.
+- **Top bar:** note icon, **track index / total**, **album folder name** (truncated), **BT** badge, **list icon** (top-right) to open the **album list** without stopping playback.
 - **Title line:** current track name (file name without extension), centered above the visualizer.
 - **Spectrum panel (“SPECTRUM”):** **16 vertical bars** that respond to the music. The sketch taps **mono samples** (L+R after volume gain) from the audio path, runs a **Hamming-windowed block** (256 samples) and **Goertzel** filters at fixed frequencies (~80 Hz–18 kHz). **Per-band AGC** and treble boost keep highs visible; MP3 assumes **44.1 kHz** sample rate for bin mapping (WAV uses the parsed rate). The bar area refreshes ~20×/s while the player screen is shown; bars decay when paused/stopped.
 - **Volume row:** **− / percentage / +** touch buttons (see `PL_VOLUME_Y`).
@@ -56,7 +56,9 @@ The playback view is laid out for a **240×320** portrait panel and is inspired 
 
 **Touch targets**
 
-- **List icon** (top-right, `PL_BACK_BTN_*`) returns to the album browser and stops playback.
+- **List icon** (top-right, `PL_BACK_BTN_*`) switches to the album browser; **playback continues** (pause/play state unchanged).
+- **Leitor** (browser header, only when an album is already loaded): returns to the player screen **without** restarting the track.
+- Tapping a **different album** in the list **stops the current decode briefly** before scanning the new folder on the SD card (avoids SPI/SD contention with MP3 streaming, which used to cause Bluetooth stutter). Then playback starts from track 1 of the new album. While browsing (list open), the sketch also **pumps the audio decoder** during TFT redraws and touch waits so the buffer stays fuller.
 - **Prev / Play–Pause / Next** are in the bottom transport bar (see `PL_TRANSPORT_Y` in the sketch).
 
 ## Hardware / Pinout used by this sketch
