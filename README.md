@@ -10,6 +10,19 @@ ESP32 “CYD” music player that:
 - Uses the **on-board RGB LED** on the back as a Bluetooth / playback indicator.
 - Acts as a **Bluetooth A2DP Source** (sends the audio to a Bluetooth speaker/headset).
 
+## Screenshots
+
+Place these JPEGs in the **repository root** (same directory as `README.md`) when you push — the Markdown below references them **by filename**.
+
+| File | What it shows |
+|------|----------------|
+| **`AlbumPlaylist.jpeg`** | **Album browser:** folder list, **Leitor** button (return to player when a session exists), **PREV/NEXT** paging, BT status in the header. |
+| **`Execution_screen.jpeg`** | **Playback screen:** spectrum (“SPECTRUM”) bars, track title, progress and times, album line, technical line, volume **−/+%/+**, transport controls, list icon (top-right). |
+
+![Album browser — file: AlbumPlaylist.jpeg](AlbumPlaylist.jpeg)
+
+![Playback screen — file: Execution_screen.jpeg](Execution_screen.jpeg)
+
 ## RGB status LED (rear of CYD)
 
 On typical **ESP32-2432S028R** boards, the rear RGB LED uses three GPIOs and is **active-low** (LOW = LED on):
@@ -25,7 +38,7 @@ On typical **ESP32-2432S028R** boards, the rear RGB LED uses three GPIOs and is 
 | State | LED pattern |
 |-------|-------------|
 | Bluetooth **not** connected (pairing / searching) | Alternating **red** and **blue** blink. |
-| Bluetooth connected and track **playing** | **Blue** blink (connection + “now playing”). |
+| Bluetooth connected and track **playing** | Alternating **green** and **blue** (one colour on at a time, ~450 ms). |
 | Bluetooth connected but **paused** / **stopped** | LED off. |
 
 The Bluetooth wait loop at startup calls the same update routine so the LED animates while the A2DP sink connects.

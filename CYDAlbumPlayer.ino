@@ -189,7 +189,7 @@ static void rgbLedInit() {
   rgbLedAllOff();
 }
 
-/** Sem fone: pisca vermelho/azul (tentando conectar). Conectado + tocando: pisca azul. Conectado parado: apagado. */
+/** Sem fone: pisca vermelho/azul (tentando conectar). Conectado + tocando: alterna verde/azul. Conectado parado: apagado. */
 static void rgbLedUpdate() {
   unsigned long now = millis();
   const bool bt = a2dp.is_connected();
@@ -209,8 +209,13 @@ static void rgbLedUpdate() {
       rgbBlinkPhase = !rgbBlinkPhase;
     }
     digitalWrite(RGB_LED_RED, HIGH);
-    digitalWrite(RGB_LED_GREEN, HIGH);
-    digitalWrite(RGB_LED_BLUE, rgbBlinkPhase ? LOW : HIGH);
+    if (rgbBlinkPhase) {
+      digitalWrite(RGB_LED_GREEN, LOW);
+      digitalWrite(RGB_LED_BLUE, HIGH);
+    } else {
+      digitalWrite(RGB_LED_GREEN, HIGH);
+      digitalWrite(RGB_LED_BLUE, LOW);
+    }
   } else if (!bt) {
     if (now - rgbLastMs >= 280) {
       rgbLastMs = now;
