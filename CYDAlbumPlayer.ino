@@ -5,6 +5,7 @@
 #include <Arduino.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
 #include <SD.h>
 #include <SPI.h>
 #include <TFT_eSPI.h>
@@ -234,20 +235,35 @@ static void rgbLedUpdate() {
   }
 }
 
-// ── Albums / tracks ────────────────────────────────────────
+// ── Playlist (scan recursivo SD, estilo ShuffleCYD) + browse 2 niveis ──
+#define MAX_TRACKS 300
 #define MAX_ALBUMS 32
-#define MAX_TRACKS 128
 #define MAX_ALBUM_NAME_LEN 48
+
+static char* playlist[MAX_TRACKS];
+static int trackCount = 0;
+
+static int shuffleOrder[MAX_TRACKS];
+enum ShuffleMode { SHUFFLE_OFF, SHUFFLE_TRACKS, SHUFFLE_ALBUM };
+static ShuffleMode shuffleMode = SHUFFLE_OFF;
 
 static char albums[MAX_ALBUMS][MAX_ALBUM_NAME_LEN];
 static int albumCount = 0;
 static int albumScroll = 0;
+static int browseTrackScroll = 0;
+
+enum BrowseLevel { BROWSE_ALBUMS, BROWSE_TRACKS };
+static BrowseLevel browseLevel = BROWSE_ALBUMS;
+static int browseAlbumIdx = -1;
+static int browseTrackIndices[MAX_TRACKS];
+static int browseTrackCount = 0;
 
 static char currentAlbumFolder[MAX_ALBUM_NAME_LEN];
 
-static char albumTracks[MAX_TRACKS][128]; // full paths
-static int albumTrackCount = 0;
+/** Indice na ordem de reproducao 0..trackCount-1 (ver resolveTrack). */
 static int currentTrack = 0;
+
+static void startTrack(int orderIdx, bool gapless = false);
 
 // ── UI ─────────────────────────────────────────────────────
 enum ScreenMode { SCREEN_BROWSER, SCREEN_PLAYER };
@@ -283,27 +299,188 @@ static bool isWAV(const char* fn) {
 static void getDisplayName(const char* path, char* out, int maxLen) {
   const char* name = strrchr(path, '/');
   if (!name) name = path;
+  else name++;
   strncpy(out, name, maxLen - 1);
   out[maxLen - 1] = '\0';
   char* dot = strrchr(out, '.');
   if (dot) *dot = '\0';
+  char* paren = strrchr(out, '(');
+  if (paren && paren > out) {
+    char* trim = paren - 1;
+    while (trim > out && *trim == ' ') trim--;
+    *(trim + 1) = '\0';
+  }
 }
 
-/** Ordenação alfabética pelo caminho completo (sem ler metadados ID3). */
-static void sortAlbumTracksByPath() {
-  if (albumTrackCount < 2) return;
-  int sortPump = 0;
-  for (int i = 0; i < albumTrackCount - 1; i++) {
-    for (int j = 0; j < albumTrackCount - 1 - i; j++) {
-      if (strcmp(albumTracks[j], albumTracks[j + 1]) > 0) {
-        char tmp[128];
-        memcpy(tmp, albumTracks[j], sizeof(tmp));
-        memcpy(albumTracks[j], albumTracks[j + 1], sizeof(albumTracks[j]));
-        memcpy(albumTracks[j + 1], tmp, sizeof(albumTracks[j + 1]));
+static void freePlaylist() {
+  for (int i = 0; i < trackCount; i++) {
+    free(playlist[i]);
+    playlist[i] = nullptr;
+  }
+  trackCount = 0;
+}
+
+static void addFile(const char* path) {
+  if (trackCount >= MAX_TRACKS) return;
+  char* c = strdup(path);
+  if (!c) return;
+  playlist[trackCount++] = c;
+}
+
+static void scanDir(File dir, int depth) {
+  if (depth > 2) return;
+  while (true) {
+    File entry = dir.openNextFile();
+    if (!entry) break;
+    if (entry.isDirectory()) {
+      scanDir(entry, depth + 1);
+    } else {
+      const char* name = entry.name();
+      if (isMP3(name) || isWAV(name)) {
+        const char* p = entry.path();
+        if (p) addFile(p);
       }
-      if ((++sortPump & 7) == 0) audioPumpPlayingMax(48);
+    }
+    entry.close();
+    audioPumpPlayingMax(16);
+  }
+}
+
+static void scanSD() {
+  File root = SD.open("/");
+  if (!root || !root.isDirectory()) return;
+  scanDir(root, 0);
+  root.close();
+}
+
+static void scanAlbums() {
+  albumCount = 0;
+  for (int i = 0; i < trackCount && albumCount < MAX_ALBUMS; i++) {
+    const char* path = playlist[i];
+    const char* lastSlash = strrchr(path, '/');
+    if (!lastSlash || lastSlash == path) continue;
+
+    int folderLen = (int)(lastSlash - path);
+    const char* folderStart = path;
+    for (int j = folderLen - 1; j >= 0; j--) {
+      if (path[j] == '/') {
+        folderStart = path + j + 1;
+        break;
+      }
+    }
+    int nameLen = (int)(lastSlash - folderStart);
+    if (nameLen <= 0 || nameLen >= MAX_ALBUM_NAME_LEN) continue;
+
+    char candidate[MAX_ALBUM_NAME_LEN];
+    strncpy(candidate, folderStart, nameLen);
+    candidate[nameLen] = '\0';
+    if (strcmp(candidate, "System Volume Information") == 0) continue;
+
+    bool exists = false;
+    for (int a = 0; a < albumCount; a++) {
+      if (strcmp(albums[a], candidate) == 0) {
+        exists = true;
+        break;
+      }
+    }
+    if (!exists) {
+      strncpy(albums[albumCount], candidate, MAX_ALBUM_NAME_LEN - 1);
+      albums[albumCount][MAX_ALBUM_NAME_LEN - 1] = '\0';
+      albumCount++;
     }
   }
+
+  if (albumCount < MAX_ALBUMS - 1) {
+    for (int i = albumCount; i > 0; i--) {
+      strncpy(albums[i], albums[i - 1], MAX_ALBUM_NAME_LEN - 1);
+      albums[i][MAX_ALBUM_NAME_LEN - 1] = '\0';
+    }
+    strncpy(albums[0], "[ All Tracks ]", MAX_ALBUM_NAME_LEN - 1);
+    albums[0][MAX_ALBUM_NAME_LEN - 1] = '\0';
+    albumCount++;
+  }
+}
+
+static void sortBrowseTrackIndices() {
+  if (browseTrackCount < 2) return;
+  for (int i = 0; i < browseTrackCount - 1; i++) {
+    for (int j = 0; j < browseTrackCount - 1 - i; j++) {
+      int a = browseTrackIndices[j];
+      int b = browseTrackIndices[j + 1];
+      if (strcmp(playlist[a], playlist[b]) > 0) {
+        int t = browseTrackIndices[j];
+        browseTrackIndices[j] = browseTrackIndices[j + 1];
+        browseTrackIndices[j + 1] = t;
+      }
+      if ((j & 3) == 0) audioPumpPlayingMax(24);
+    }
+  }
+}
+
+static void loadBrowseAlbumTracks(const char* albumName) {
+  browseTrackCount = 0;
+  if (strcmp(albumName, "[ All Tracks ]") == 0) {
+    for (int i = 0; i < trackCount && browseTrackCount < MAX_TRACKS; i++)
+      browseTrackIndices[browseTrackCount++] = i;
+    sortBrowseTrackIndices();
+    return;
+  }
+  for (int i = 0; i < trackCount && browseTrackCount < MAX_TRACKS; i++) {
+    const char* path = playlist[i];
+    const char* lastSlash = strrchr(path, '/');
+    if (!lastSlash) continue;
+    const char* folderStart = path;
+    int folderLen = (int)(lastSlash - path);
+    for (int j = folderLen - 1; j >= 0; j--) {
+      if (path[j] == '/') {
+        folderStart = path + j + 1;
+        break;
+      }
+    }
+    int nameLen = (int)(lastSlash - folderStart);
+    if (nameLen == (int)strlen(albumName) && strncmp(folderStart, albumName, nameLen) == 0)
+      browseTrackIndices[browseTrackCount++] = i;
+  }
+  sortBrowseTrackIndices();
+}
+
+static void generateShuffleOrder() {
+  for (int i = 0; i < trackCount; i++) shuffleOrder[i] = i;
+  for (int i = trackCount - 1; i > 0; i--) {
+    int j = random(0, i + 1);
+    int tmp = shuffleOrder[i];
+    shuffleOrder[i] = shuffleOrder[j];
+    shuffleOrder[j] = tmp;
+  }
+}
+
+static int resolveTrack(int index) {
+  if (trackCount <= 0) return 0;
+  if (shuffleMode == SHUFFLE_TRACKS) return shuffleOrder[index % trackCount];
+  return index % trackCount;
+}
+
+static void setCurrentAlbumFromPath(const char* path) {
+  const char* lastSlash = strrchr(path, '/');
+  if (!lastSlash || lastSlash == path) {
+    currentAlbumFolder[0] = '\0';
+    return;
+  }
+  const char* folderStart = path;
+  int folderLen = (int)(lastSlash - path);
+  for (int j = folderLen - 1; j >= 0; j--) {
+    if (path[j] == '/') {
+      folderStart = path + j + 1;
+      break;
+    }
+  }
+  int nameLen = (int)(lastSlash - folderStart);
+  if (nameLen <= 0 || nameLen >= MAX_ALBUM_NAME_LEN) {
+    currentAlbumFolder[0] = '\0';
+    return;
+  }
+  memcpy(currentAlbumFolder, folderStart, nameLen);
+  currentAlbumFolder[nameLen] = '\0';
 }
 
 /** Duração WAV a partir do cartão (chunks fmt/data); *outRate = sample rate Hz se não for NULL. */
@@ -413,74 +590,8 @@ static uint32_t elapsedPlaybackSec() {
   return 0;
 }
 
-// ── SD: scan albums (folders in root) ───────────────────────
-static void scanAlbums() {
-  albumCount = 0;
-  File root = SD.open("/");
-  if (!root || !root.isDirectory()) return;
-
-  while (true) {
-    File entry = root.openNextFile();
-    if (!entry) break;
-    if (entry.isDirectory()) {
-      if (albumCount < MAX_ALBUMS) {
-        const char* nm = entry.name();
-        const char* slash = strrchr(nm, '/');
-        nm = slash ? slash + 1 : nm;
-        // Some SD cards create this folder automatically; ignore.
-        if (strcmp(nm, "System Volume Information") == 0) {
-          entry.close();
-          continue;
-        }
-        strncpy(albums[albumCount], nm, MAX_ALBUM_NAME_LEN - 1);
-        albums[albumCount][MAX_ALBUM_NAME_LEN - 1] = '\0';
-        albumCount++;
-      }
-    }
-    entry.close();
-  }
-  root.close();
-}
-
-static void loadAlbumTracks(const char* albumName) {
-  albumTrackCount = 0;
-  if (!albumName || !albumName[0]) return;
-
-  strncpy(currentAlbumFolder, albumName, sizeof(currentAlbumFolder) - 1);
-  currentAlbumFolder[sizeof(currentAlbumFolder) - 1] = '\0';
-
-  char dirPath[96];
-  snprintf(dirPath, sizeof(dirPath), "/%s", albumName);
-
-  File dir = SD.open(dirPath);
-  if (!dir || !dir.isDirectory()) return;
-
-  int dirPump = 0;
-  while (true) {
-    File entry = dir.openNextFile();
-    if (!entry) break;
-    if (!entry.isDirectory() && albumTrackCount < MAX_TRACKS) {
-      const char* nm = entry.name();
-      const char* slash = strrchr(nm, '/');
-      nm = slash ? slash + 1 : nm;
-      if (isMP3(nm) || isWAV(nm)) {
-        char full[128];
-        snprintf(full, sizeof(full), "%s/%s", dirPath, nm);
-        strncpy(albumTracks[albumTrackCount], full, sizeof(albumTracks[albumTrackCount]) - 1);
-        albumTracks[albumTrackCount][sizeof(albumTracks[albumTrackCount]) - 1] = '\0';
-        albumTrackCount++;
-      }
-    }
-    entry.close();
-    if ((++dirPump & 2) == 0) audioPumpPlayingMax(72);
-  }
-  dir.close();
-
-  sortAlbumTracksByPath();
-}
-
 // ── Audio: stop/start/next/prev ────────────────────────────
-static void stopTrack() {
+static void stopTrack(bool flushRing = true) {
   if (mp3 && mp3->isRunning()) mp3->stop();
   if (wav && wav->isRunning()) wav->stop();
   if (mp3) { delete mp3; mp3 = nullptr; }
@@ -488,8 +599,10 @@ static void stopTrack() {
   if (audioFile) { delete audioFile; audioFile = nullptr; }
   currentType = AUDIO_NONE;
   playerState = STATE_STOPPED;
-  rbHead = 0;
-  rbTail = 0;
+  if (flushRing) {
+    rbHead = 0;
+    rbTail = 0;
+  }
   trackWallStartMs = 0;
   accumulatedPauseMs = 0;
   pauseBeganMs = 0;
@@ -497,18 +610,24 @@ static void stopTrack() {
   cachedWavRateHz = 0;
 }
 
-static void startTrack(int idx) {
-  if (albumTrackCount <= 0) return;
-  if (idx < 0) idx = albumTrackCount - 1;
-  if (idx >= albumTrackCount) idx = 0;
+static void startTrack(int orderIdx, bool gapless) {
+  if (trackCount <= 0) return;
+  int idx = orderIdx;
+  if (idx < 0) idx = trackCount - 1;
+  if (idx >= trackCount) idx = 0;
   currentTrack = idx;
 
-  stopTrack();
+  stopTrack(!gapless);
 
-  audioFile = new AudioFileSourceSD(albumTracks[currentTrack]);
+  int actual = resolveTrack(currentTrack);
+  const char* path = playlist[actual];
+
+  setCurrentAlbumFromPath(path);
+
+  audioFile = new AudioFileSourceSD(path);
   if (!audioFile) return;
 
-  if (isWAV(albumTracks[currentTrack])) {
+  if (isWAV(path)) {
     wav = new AudioGeneratorWAV();
     wav->begin(audioFile, audioOut);
     currentType = AUDIO_WAV;
@@ -524,7 +643,7 @@ static void startTrack(int idx) {
   pauseBeganMs = 0;
   cachedWavRateHz = 0;
   if (currentType == AUDIO_WAV) {
-    cachedDurationSec = wavParseDurationAndRate(albumTracks[currentTrack], &cachedWavRateHz);
+    cachedDurationSec = wavParseDurationAndRate(path, &cachedWavRateHz);
   } else if (audioFile && currentType == AUDIO_MP3) {
     uint32_t sz = audioFile->getSize();
     cachedDurationSec = (sz > 0) ? (sz / 16000u) : 0;
@@ -533,9 +652,8 @@ static void startTrack(int idx) {
     cachedDurationSec = 0;
   }
 
-  // Pre-fill for BT stability
   int loops = 0;
-  int target = (RING_SIZE * 3) / 4;
+  int target = gapless ? (RING_SIZE / 4) : ((RING_SIZE * 3) / 4);
   while ((int)rbAvail() < target && loops < 1024) {
     bool ok = false;
     if (currentType == AUDIO_MP3 && mp3 && mp3->isRunning()) ok = mp3->loop();
@@ -545,8 +663,52 @@ static void startTrack(int idx) {
   }
 }
 
-static void nextTrack() { startTrack(currentTrack + 1); }
-static void prevTrack() { startTrack(currentTrack - 1); }
+static void nextTrack(bool gapless = false) {
+  if (shuffleMode == SHUFFLE_ALBUM && trackCount > 1) {
+    int actual = resolveTrack(currentTrack);
+    const char* curPath = playlist[actual];
+    const char* lastSlash = strrchr(curPath, '/');
+    int folderLen = lastSlash ? (int)(lastSlash - curPath) : 0;
+
+    int sameFolder[MAX_TRACKS];
+    int sameFolderCount = 0;
+    for (int i = 0; i < trackCount && sameFolderCount < MAX_TRACKS; i++) {
+      if (folderLen > 0 && strncmp(playlist[i], curPath, folderLen) == 0 &&
+          playlist[i][folderLen] == '/') {
+        sameFolder[sameFolderCount++] = i;
+      }
+    }
+
+    if (sameFolderCount > 1) {
+      int pick = random(0, sameFolderCount);
+      if (sameFolder[pick] == actual) pick = (pick + 1) % sameFolderCount;
+      startTrack(sameFolder[pick], gapless);
+      return;
+    }
+  }
+  startTrack(currentTrack + 1, gapless);
+}
+
+static void prevTrack() {
+  startTrack(currentTrack > 0 ? currentTrack - 1 : trackCount - 1, false);
+}
+
+static int orderPosForPlaylistIndex(int pi) {
+  if (shuffleMode != SHUFFLE_TRACKS) return pi;
+  for (int k = 0; k < trackCount; k++) {
+    if (shuffleOrder[k] == pi) return k;
+  }
+  generateShuffleOrder();
+  for (int k = 0; k < trackCount; k++) {
+    if (shuffleOrder[k] == pi) return k;
+  }
+  return 0;
+}
+
+static void startPlayingFromPlaylistIndex(int pi) {
+  if (pi < 0 || pi >= trackCount) return;
+  startTrack(orderPosForPlaylistIndex(pi), false);
+}
 static void togglePause() {
   if (playerState == STATE_PLAYING) {
     playerState = STATE_PAUSED;
@@ -698,7 +860,10 @@ static void drawBrowser() {
   tft.setTextColor(COL_TEXT, COL_BTN);
   tft.setTextSize(1);
   tft.setCursor(10, 4);
-  tft.print("Albums");
+  if (browseLevel == BROWSE_ALBUMS)
+    tft.print("Albums");
+  else
+    tft.print("< Lista");
 
   // BT status: icon + headset name
   uint16_t btCol = btConnected ? COL_ACCENT : TFT_RED;
@@ -719,7 +884,7 @@ static void drawBrowser() {
   }
   else              tft.print("BT..");
 
-  if (albumTrackCount > 0) {
+  if (trackCount > 0) {
     int bx = BROWSE_PLAYER_BTN_X, by = BROWSE_PLAYER_BTN_Y, bw = BROWSE_PLAYER_BTN_W, bh = BROWSE_PLAYER_BTN_H;
     tft.fillRoundRect(bx, by, bw, bh, 4, COL_BTN);
     uint16_t acc = colInfoCyan();
@@ -735,7 +900,23 @@ static void drawBrowser() {
   tft.setTextColor(COL_DIM, COL_BG);
   tft.setTextSize(1);
   tft.setCursor(10, browsePathY);
-  tft.print("Touch an album");
+  {
+    const char* shf =
+        (shuffleMode == SHUFFLE_OFF) ? "SHF:OFF" : ((shuffleMode == SHUFFLE_TRACKS) ? "SHF:ALL" : "SHF:ALB");
+    if (browseLevel == BROWSE_TRACKS && browseAlbumIdx >= 0 && browseAlbumIdx < albumCount) {
+      char alb[18];
+      strncpy(alb, albums[browseAlbumIdx], sizeof(alb) - 1);
+      alb[sizeof(alb) - 1] = '\0';
+      if (strlen(alb) > 12) {
+        alb[10] = '.';
+        alb[11] = '.';
+        alb[12] = '\0';
+      }
+      tft.printf("%s | %s", shf, alb);
+    } else {
+      tft.printf("%s  linha:toque", shf);
+    }
+  }
 
   int fY = footerY();
   int vis = visibleSlots();
@@ -748,23 +929,35 @@ static void drawBrowser() {
   tft.setCursor(186, fY + 15);
   tft.print("NEXT");
 
-  int totalPages = (albumCount + vis - 1) / vis;
+  int itemCount = (browseLevel == BROWSE_ALBUMS) ? albumCount : browseTrackCount;
+  int scroll = (browseLevel == BROWSE_ALBUMS) ? albumScroll : browseTrackScroll;
+  int totalPages = (itemCount + vis - 1) / vis;
   if (totalPages < 1) totalPages = 1;
-  int page = (albumScroll / vis) + 1;
+  int page = (scroll / vis) + 1;
   if (page > totalPages) page = totalPages;
   tft.setTextColor(COL_DIM, COL_BG);
   tft.setCursor(104, fY + 15);
   tft.printf("%d/%d", page, totalPages);
 
   for (int i = 0; i < vis; i++) {
-    int idx = albumScroll + i;
-    if (idx >= albumCount) break;
+    int idx = scroll + i;
+    if (idx >= itemCount) break;
     int y = browseListY + i * browseItemH;
     tft.fillRoundRect(6, y + 1, SCR_W - 12, browseItemH - 3, 5, COL_DIR);
-    tft.setTextColor(COL_TEXT, COL_DIR);
     tft.setTextSize(1);
     tft.setCursor(12, y + 7);
-    tft.print(albums[idx]);
+    if (browseLevel == BROWSE_ALBUMS) {
+      tft.setTextColor(COL_TEXT, COL_DIR);
+      tft.print(albums[idx]);
+    } else {
+      int pi = browseTrackIndices[idx];
+      char disp[40];
+      getDisplayName(playlist[pi], disp, sizeof(disp));
+      int actualPlaying = resolveTrack(currentTrack);
+      bool on = (pi == actualPlaying && (playerState == STATE_PLAYING || playerState == STATE_PAUSED));
+      tft.setTextColor(on ? colInfoCyan() : COL_TEXT, COL_DIR);
+      tft.print(disp);
+    }
     if ((i & 1) == 0) audioPumpPlayingMax(48);
   }
   audioPumpPlayingMax(384);
@@ -1049,7 +1242,7 @@ static void drawPlayer() {
   tft.setTextColor(COL_TEXT, colTopBarBg());
   tft.setTextSize(2);
   tft.setCursor(22, 8);
-  if (albumTrackCount > 0) tft.printf("%d/%d", currentTrack + 1, albumTrackCount);
+  if (trackCount > 0) tft.printf("%d/%d", currentTrack + 1, trackCount);
   else tft.print("-/-");
 
   {
@@ -1083,8 +1276,10 @@ static void drawPlayer() {
 
   // ── Título da faixa ─────────────────────────────────────
   char title[64];
-  if (albumTrackCount > 0) getDisplayName(albumTracks[currentTrack], title, sizeof(title));
-  else strncpy(title, "Sem faixa", sizeof(title) - 1);
+  if (trackCount > 0)
+    getDisplayName(playlist[resolveTrack(currentTrack)], title, sizeof(title));
+  else
+    strncpy(title, "Sem faixa", sizeof(title) - 1);
   title[sizeof(title) - 1] = '\0';
   tft.setTextSize(1);
   drawTitleCentered(PL_TITLE_Y, 220, title);
@@ -1165,7 +1360,15 @@ static void handleTouch() {
   }
 
   if (screenMode == SCREEN_BROWSER) {
-    if (albumTrackCount > 0 &&
+    if (browseLevel == BROWSE_TRACKS && ty < browseHeaderH && tx < 64) {
+      browseLevel = BROWSE_ALBUMS;
+      browseAlbumIdx = -1;
+      browseTrackScroll = 0;
+      drawBrowser();
+      return;
+    }
+
+    if (trackCount > 0 &&
         ty >= BROWSE_PLAYER_BTN_Y && ty < BROWSE_PLAYER_BTN_Y + BROWSE_PLAYER_BTN_H &&
         tx >= BROWSE_PLAYER_BTN_X && tx < BROWSE_PLAYER_BTN_X + BROWSE_PLAYER_BTN_W) {
       screenMode = SCREEN_PLAYER;
@@ -1173,35 +1376,53 @@ static void handleTouch() {
       return;
     }
 
+    if (ty >= browsePathY - 2 && ty < browseListY) {
+      if (shuffleMode == SHUFFLE_OFF) {
+        shuffleMode = SHUFFLE_TRACKS;
+        generateShuffleOrder();
+      } else if (shuffleMode == SHUFFLE_TRACKS) {
+        shuffleMode = SHUFFLE_ALBUM;
+      } else {
+        shuffleMode = SHUFFLE_OFF;
+      }
+      drawBrowser();
+      return;
+    }
+
     int fY = footerY();
     int vis = visibleSlots();
-    int btnY0 = fY;                 // altura total do rodapé (tolerante)
-    int btnY1 = fY + browseFooterH; // SCR_H-browseFooterH ... SCR_H-1
+    int btnY0 = fY;
+    int btnY1 = fY + browseFooterH;
+    int itemCount = (browseLevel == BROWSE_ALBUMS) ? albumCount : browseTrackCount;
 
     // PREV
     if (ty >= btnY0 && ty <= btnY1 && tx >= 0 && tx <= 72) {
-      albumScroll = max(0, albumScroll - vis);
+      if (browseLevel == BROWSE_ALBUMS)
+        albumScroll = max(0, albumScroll - vis);
+      else
+        browseTrackScroll = max(0, browseTrackScroll - vis);
       drawBrowser();
       return;
     }
     // NEXT
     if (ty >= btnY0 && ty <= btnY1 && tx >= 168 && tx <= SCR_W) {
-      if (albumScroll + vis < albumCount) albumScroll += vis;
+      if (browseLevel == BROWSE_ALBUMS) {
+        if (albumScroll + vis < albumCount) albumScroll += vis;
+      } else {
+        if (browseTrackScroll + vis < browseTrackCount) browseTrackScroll += vis;
+      }
       drawBrowser();
       return;
     }
 
-    // Taps on the list must happen within the visible rectangle.
-    // Without this upper bound, button clicks may "escape" and open an item
-    // that's not on screen (e.g., the last album).
     int listTop = browseListY;
-    int listBottom = browseListY + vis * browseItemH; // exclusivo
+    int listBottom = browseListY + vis * browseItemH;
     if (ty < listTop || ty >= listBottom) return;
     int indexInView = (ty - browseListY) / browseItemH;
-    int idx = albumScroll + indexInView;
-    if (idx < 0 || idx >= albumCount) return;
+    int scroll = (browseLevel == BROWSE_ALBUMS) ? albumScroll : browseTrackScroll;
+    int idx = scroll + indexInView;
+    if (idx < 0 || idx >= itemCount) return;
 
-    // visual feedback (reabastecer áudio durante a pausa — evita buraco no BT)
     int y = browseListY + indexInView * browseItemH;
     tft.fillRoundRect(6, y + 1, SCR_W - 12, browseItemH - 3, 5, COL_BTN_ACT);
     {
@@ -1209,15 +1430,19 @@ static void handleTouch() {
       while (millis() - t0 < 50) audioPumpPlayingMax(200);
     }
 
-    // Parar decode antes de ler o novo álbum no SD — evita SPI/cartão partilhado com MP3 a tocar
-    if (playerState != STATE_STOPPED) stopTrack();
-
-    loadAlbumTracks(albums[idx]);
-    if (albumTrackCount > 0) {
-      startTrack(0);
-      screenMode = SCREEN_PLAYER;
-      drawPlayer();
+    if (browseLevel == BROWSE_ALBUMS) {
+      browseAlbumIdx = idx;
+      loadBrowseAlbumTracks(albums[idx]);
+      browseLevel = BROWSE_TRACKS;
+      browseTrackScroll = 0;
+      drawBrowser();
+      return;
     }
+
+    if (playerState != STATE_STOPPED) stopTrack(true);
+    startPlayingFromPlaylistIndex(browseTrackIndices[idx]);
+    screenMode = SCREEN_PLAYER;
+    drawPlayer();
   } else { // SCREEN_PLAYER
     // Lista: volta às pastas; a música continua a tocar
     if (ty >= PL_BACK_BTN_Y && ty < PL_BACK_BTN_Y + PL_BACK_BTN_H &&
@@ -1307,7 +1532,22 @@ void setup() {
   rgbPrevBt = btConnected;
   rgbPrevPlaying = (playerState == STATE_PLAYING);
 
+  scanSD();
+  if (trackCount == 0) {
+    tft.setTextColor(TFT_YELLOW, COL_BG);
+    tft.setTextSize(2);
+    tft.setCursor(20, 120);
+    tft.print("Sem musicas");
+    while (1) {
+      rgbLedUpdate();
+      delay(500);
+    }
+  }
   scanAlbums();
+  generateShuffleOrder();
+  browseLevel = BROWSE_ALBUMS;
+  browseAlbumIdx = -1;
+  browseTrackScroll = 0;
   screenMode = SCREEN_BROWSER;
   albumScroll = 0;
   drawBrowser();
@@ -1354,7 +1594,7 @@ void loop() {
     } else {
       // Decoder stopped — wait for the ring buffer to drain before switching tracks with fewer glitches.
       if (rbAvail() < 200) {
-        nextTrack();
+        nextTrack(true);
         if (screenMode == SCREEN_PLAYER) drawPlayer();
       }
     }
