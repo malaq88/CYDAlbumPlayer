@@ -25,8 +25,8 @@
 #define TOUCH_IRQ  36
 #define TFT_BL     21
 
-// RGB traseiro da CYD (ESP32-2432S028R): R=4, G=16, B=17 — ativo em LOW (LOW = aceso).
-// Alguns clones podem variar; o LED “da frente” em muitos modelos é só o reflexo/chassi, não outro GPIO.
+// Rear RGB on CYD (ESP32-2432S028R): R=4, G=16, B=17 — active LOW (LOW = on).
+// Clones may differ; the front “LED” on many boards is chassis reflection, not another GPIO.
 #define RGB_LED_RED    4
 #define RGB_LED_GREEN 16
 #define RGB_LED_BLUE   17
@@ -45,7 +45,7 @@ SPIClass touchSPI(HSPI);
 TFT_eSPI tft = TFT_eSPI();
 XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
 
-// ── Cores ───────────────────────────────────────────────────
+// ── Colors ──────────────────────────────────────────────────
 #define COL_BG       TFT_BLACK
 #define COL_TEXT     TFT_WHITE
 #define COL_DIM      tft.color565(120, 120, 120)
@@ -54,19 +54,19 @@ XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
 #define COL_BTN_ACT  tft.color565(70, 70, 70)
 #define COL_DIR      tft.color565(35, 45, 70)
 
-// Dimensoes em retrato (240x320)
+// Portrait dimensions (240x320)
 static const int SCR_W = 240;
 static const int SCR_H = 320;
 
-// Player screen (estilo DAP) - layout retrato
+// Player screen (DAP-style) — portrait layout
 static const int PL_HEADER_H       = 38;
-static const int PL_TITLE_Y        = 40;  // título da faixa (abaixo da barra)
-static const int PL_CASSETTE_TOP   = 52;  // topo do painel do visualizador (barras)
+static const int PL_TITLE_Y        = 40;  // track title (below top bar)
+static const int PL_CASSETTE_TOP   = 52;  // top of spectrum visualizer panel
 static const int PL_PROGRESS_TOP   = 164;
 static const int PL_PROGRESS_H     = 56;
 static const int PL_VOLUME_Y       = 224;
 static const int PL_TRANSPORT_Y    = 262;
-// Botão lista (topo): volta ao browser; área de toque explícita
+// List button (top): back to browser; explicit touch hit area
 static const int PL_BACK_BTN_X     = 166;
 static const int PL_BACK_BTN_Y     = 4;
 static const int PL_BACK_BTN_W     = 70;
@@ -97,14 +97,14 @@ static inline size_t rbAvail() {
   return (h >= t) ? (h - t) : (RING_SIZE - t + h);
 }
 
-// Amostras mono para visualizador (Goertzel por banda)
+// Mono samples for visualizer (per-band Goertzel)
 #define VIS_BUF_LEN 512
 #define VIS_N       256
 #define NUM_VIS_BARS 16
 static int16_t visRing[VIS_BUF_LEN];
 static volatile uint32_t visWritePos = 0;
 static float visBandVal[NUM_VIS_BARS];
-/** Envelope lento por banda (AGC independente — evita que graves dominem e matem as agudas). */
+/** Slow per-band envelope (independent AGC — keeps bass from masking treble). */
 static float visBandEnv[NUM_VIS_BARS];
 
 static const float VIS_FREQ_HZ[NUM_VIS_BARS] = {
@@ -157,7 +157,7 @@ static AudioType currentType = AUDIO_NONE;
 enum PlayerState { STATE_STOPPED, STATE_PLAYING, STATE_PAUSED };
 static PlayerState playerState = STATE_STOPPED;
 
-/** Enche o ring buffer durante TFT/SD/delay (evita underrun A2DP ao mudar de ecrã ou álbum). */
+/** Fill ring buffer during TFT/SD/delay (reduces A2DP underrun when changing screen or album). */
 static void audioPumpPlayingMax(int maxLoops) {
   if (playerState != STATE_PLAYING) return;
   const int target = (RING_SIZE * 3) / 4;
@@ -171,7 +171,7 @@ static void audioPumpPlayingMax(int maxLoops) {
   }
 }
 
-// ── LED RGB traseiro (estado Bluetooth / reprodução) ─────
+// ── Rear RGB LED (Bluetooth / playback state) ───────────────
 static unsigned long rgbLastMs = 0;
 static bool rgbBlinkPhase = false;
 static bool rgbPrevBt = false;
@@ -190,7 +190,7 @@ static void rgbLedInit() {
   rgbLedAllOff();
 }
 
-/** Sem fone: pisca vermelho/azul (tentando conectar). Conectado + tocando: alterna verde/azul. Conectado parado: apagado. */
+/** No headset: red/blue blink (connecting). Connected + playing: green/blue alternation. Connected idle: off. */
 static void rgbLedUpdate() {
   unsigned long now = millis();
   const bool bt = a2dp.is_connected();
@@ -235,17 +235,13 @@ static void rgbLedUpdate() {
   }
 }
 
-// ── Playlist (scan recursivo SD, estilo ShuffleCYD) + browse 2 niveis ──
+// ── Playlist (recursive SD scan) + two-level browser ────────
 #define MAX_TRACKS 300
 #define MAX_ALBUMS 32
 #define MAX_ALBUM_NAME_LEN 48
 
 static char* playlist[MAX_TRACKS];
 static int trackCount = 0;
-
-static int shuffleOrder[MAX_TRACKS];
-enum ShuffleMode { SHUFFLE_OFF, SHUFFLE_TRACKS, SHUFFLE_ALBUM };
-static ShuffleMode shuffleMode = SHUFFLE_OFF;
 
 static char albums[MAX_ALBUMS][MAX_ALBUM_NAME_LEN];
 static int albumCount = 0;
@@ -260,7 +256,7 @@ static int browseTrackCount = 0;
 
 static char currentAlbumFolder[MAX_ALBUM_NAME_LEN];
 
-/** Indice na ordem de reproducao 0..trackCount-1 (ver resolveTrack). */
+/** Playlist index 0..trackCount-1. */
 static int currentTrack = 0;
 
 static void startTrack(int orderIdx, bool gapless = false);
@@ -270,15 +266,19 @@ enum ScreenMode { SCREEN_BROWSER, SCREEN_PLAYER };
 static ScreenMode screenMode = SCREEN_BROWSER;
 
 static const int browseHeaderH = 30;
-static const int browsePathY = 34;
-static const int browseListY = 50;
+static const int browseListY = 55;  // below path row (play button)
 static const int browseFooterH = 36;
 static const int browseItemH = 24;
-// Botão "Leitor" no browser: volta ao ecrã de reprodução (música continua)
+// Browser header "Player": return to playback screen (playback continues)
 static const int BROWSE_PLAYER_BTN_X = 72;
 static const int BROWSE_PLAYER_BTN_Y = 4;
 static const int BROWSE_PLAYER_BTN_W = 72;
 static const int BROWSE_PLAYER_BTN_H = 22;
+// Path row: centered play button (opens player; same as header when tracks exist)
+static const int BROWSE_PATH_PLAY_BTN_X = 100;
+static const int BROWSE_PATH_PLAY_BTN_Y = 36;
+static const int BROWSE_PATH_PLAY_BTN_W = 40;
+static const int BROWSE_PATH_PLAY_BTN_H = 18;
 
 static inline int footerY() { return SCR_H - browseFooterH; }
 static inline int visibleSlots() {
@@ -444,22 +444,6 @@ static void loadBrowseAlbumTracks(const char* albumName) {
   sortBrowseTrackIndices();
 }
 
-static void generateShuffleOrder() {
-  for (int i = 0; i < trackCount; i++) shuffleOrder[i] = i;
-  for (int i = trackCount - 1; i > 0; i--) {
-    int j = random(0, i + 1);
-    int tmp = shuffleOrder[i];
-    shuffleOrder[i] = shuffleOrder[j];
-    shuffleOrder[j] = tmp;
-  }
-}
-
-static int resolveTrack(int index) {
-  if (trackCount <= 0) return 0;
-  if (shuffleMode == SHUFFLE_TRACKS) return shuffleOrder[index % trackCount];
-  return index % trackCount;
-}
-
 static void setCurrentAlbumFromPath(const char* path) {
   const char* lastSlash = strrchr(path, '/');
   if (!lastSlash || lastSlash == path) {
@@ -483,7 +467,7 @@ static void setCurrentAlbumFromPath(const char* path) {
   currentAlbumFolder[nameLen] = '\0';
 }
 
-/** Duração WAV a partir do cartão (chunks fmt/data); *outRate = sample rate Hz se não for NULL. */
+/** WAV duration from SD (fmt/data chunks); *outRate = sample rate Hz if non-NULL. */
 static uint32_t wavParseDurationAndRate(const char* path, uint32_t* outRate) {
   if (outRate) *outRate = 0;
   File f = SD.open(path, FILE_READ);
@@ -539,7 +523,7 @@ static void formatTimeHMS(char* buf, size_t n, uint32_t sec) {
   snprintf(buf, n, "%02lu:%02lu:%02lu", (unsigned long)h, (unsigned long)m, (unsigned long)s);
 }
 
-/** Uma linha centrada (texto 1); corta com ".." se não couber em maxPx. */
+/** Single centered line (size 1); truncates with ".." if wider than maxPx. */
 static void drawTitleCentered(int y, int maxPx, const char* s) {
   char buf[52];
   strncpy(buf, s ? s : "", sizeof(buf) - 1);
@@ -559,7 +543,7 @@ static void drawTitleCentered(int y, int maxPx, const char* s) {
   tft.print(buf);
 }
 
-// ── Playback timeline (relógio pausa/resume coerente) ───────
+// ── Playback timeline (pause/resume coherent with wall clock) ─
 static unsigned long trackWallStartMs   = 0;
 static unsigned long accumulatedPauseMs = 0;
 static unsigned long pauseBeganMs       = 0;
@@ -619,8 +603,7 @@ static void startTrack(int orderIdx, bool gapless) {
 
   stopTrack(!gapless);
 
-  int actual = resolveTrack(currentTrack);
-  const char* path = playlist[actual];
+  const char* path = playlist[currentTrack];
 
   setCurrentAlbumFromPath(path);
 
@@ -664,28 +647,6 @@ static void startTrack(int orderIdx, bool gapless) {
 }
 
 static void nextTrack(bool gapless = false) {
-  if (shuffleMode == SHUFFLE_ALBUM && trackCount > 1) {
-    int actual = resolveTrack(currentTrack);
-    const char* curPath = playlist[actual];
-    const char* lastSlash = strrchr(curPath, '/');
-    int folderLen = lastSlash ? (int)(lastSlash - curPath) : 0;
-
-    int sameFolder[MAX_TRACKS];
-    int sameFolderCount = 0;
-    for (int i = 0; i < trackCount && sameFolderCount < MAX_TRACKS; i++) {
-      if (folderLen > 0 && strncmp(playlist[i], curPath, folderLen) == 0 &&
-          playlist[i][folderLen] == '/') {
-        sameFolder[sameFolderCount++] = i;
-      }
-    }
-
-    if (sameFolderCount > 1) {
-      int pick = random(0, sameFolderCount);
-      if (sameFolder[pick] == actual) pick = (pick + 1) % sameFolderCount;
-      startTrack(sameFolder[pick], gapless);
-      return;
-    }
-  }
   startTrack(currentTrack + 1, gapless);
 }
 
@@ -693,21 +654,9 @@ static void prevTrack() {
   startTrack(currentTrack > 0 ? currentTrack - 1 : trackCount - 1, false);
 }
 
-static int orderPosForPlaylistIndex(int pi) {
-  if (shuffleMode != SHUFFLE_TRACKS) return pi;
-  for (int k = 0; k < trackCount; k++) {
-    if (shuffleOrder[k] == pi) return k;
-  }
-  generateShuffleOrder();
-  for (int k = 0; k < trackCount; k++) {
-    if (shuffleOrder[k] == pi) return k;
-  }
-  return 0;
-}
-
 static void startPlayingFromPlaylistIndex(int pi) {
   if (pi < 0 || pi >= trackCount) return;
-  startTrack(orderPosForPlaylistIndex(pi), false);
+  startTrack(pi, false);
 }
 static void togglePause() {
   if (playerState == STATE_PLAYING) {
@@ -722,7 +671,7 @@ static void togglePause() {
   }
 }
 
-// ── Visualizador (Goertzel por banda; amostras em visRing no ConsumeSample) ──
+// ── Visualizer (per-band Goertzel; samples in visRing from ConsumeSample) ──
 static float visGoertzelMag(const float* x, int N, float freqHz, float sampleRateHz) {
   const float PI_F = 3.14159265f;
   if (freqHz <= 0 || freqHz >= sampleRateHz * 0.48f) return 0;
@@ -768,13 +717,13 @@ static void computeVisBands() {
     raw[b] = visGoertzelMag(wf, VIS_N, fh, sr);
   }
 
-  // Boost nas agudas (Goertzel em janela curta tem menos energia nas altas) + AGC por banda.
+  // Treble boost (short window loses high-frequency energy) + per-band AGC.
   for (int b = 0; b < NUM_VIS_BARS; b++) {
     float treble = 0.55f + (float)b * 0.32f; // ~0.55 … ~5.5
     float scaled = raw[b] * treble;
     visBandEnv[b] = visBandEnv[b] * 0.90f + scaled * 0.10f;
     if (visBandEnv[b] < 1e-7f) visBandEnv[b] = 1e-7f;
-    // Divisor baixo = mais sensível; curva suave (não t²) preserva picos médios
+    // Low divisor = more sensitive; smooth curve (not t²) keeps mid peaks
     float t = scaled / (visBandEnv[b] * 1.35f + 1e-6f);
     t = powf(t, 0.55f);
     if (t > 1.0f) t = 1.0f;
@@ -863,7 +812,7 @@ static void drawBrowser() {
   if (browseLevel == BROWSE_ALBUMS)
     tft.print("Albums");
   else
-    tft.print("< Lista");
+    tft.print("< List");
 
   // BT status: icon + headset name
   uint16_t btCol = btConnected ? COL_ACCENT : TFT_RED;
@@ -894,28 +843,17 @@ static void drawBrowser() {
     tft.setTextColor(COL_TEXT, COL_BTN);
     tft.setTextSize(1);
     tft.setCursor(bx + 22, by + 8);
-    tft.print("Leitor");
+    tft.print("Player");
   }
 
-  tft.setTextColor(COL_DIM, COL_BG);
-  tft.setTextSize(1);
-  tft.setCursor(10, browsePathY);
-  {
-    const char* shf =
-        (shuffleMode == SHUFFLE_OFF) ? "SHF:OFF" : ((shuffleMode == SHUFFLE_TRACKS) ? "SHF:ALL" : "SHF:ALB");
-    if (browseLevel == BROWSE_TRACKS && browseAlbumIdx >= 0 && browseAlbumIdx < albumCount) {
-      char alb[18];
-      strncpy(alb, albums[browseAlbumIdx], sizeof(alb) - 1);
-      alb[sizeof(alb) - 1] = '\0';
-      if (strlen(alb) > 12) {
-        alb[10] = '.';
-        alb[11] = '.';
-        alb[12] = '\0';
-      }
-      tft.printf("%s | %s", shf, alb);
-    } else {
-      tft.printf("%s  linha:toque", shf);
-    }
+  if (trackCount > 0) {
+    int bx = BROWSE_PATH_PLAY_BTN_X, by = BROWSE_PATH_PLAY_BTN_Y;
+    int bw = BROWSE_PATH_PLAY_BTN_W, bh = BROWSE_PATH_PLAY_BTN_H;
+    tft.fillRoundRect(bx, by, bw, bh, 4, COL_BTN);
+    uint16_t acc = colInfoCyan();
+    int cx = bx + bw / 2;
+    int cy = by + bh / 2;
+    tft.fillTriangle(cx - 5, cy - 6, cx - 5, cy + 6, cx + 8, cy, acc);
   }
 
   int fY = footerY();
@@ -953,8 +891,7 @@ static void drawBrowser() {
       int pi = browseTrackIndices[idx];
       char disp[40];
       getDisplayName(playlist[pi], disp, sizeof(disp));
-      int actualPlaying = resolveTrack(currentTrack);
-      bool on = (pi == actualPlaying && (playerState == STATE_PLAYING || playerState == STATE_PAUSED));
+      bool on = (pi == currentTrack && (playerState == STATE_PLAYING || playerState == STATE_PAUSED));
       tft.setTextColor(on ? colInfoCyan() : COL_TEXT, COL_DIR);
       tft.print(disp);
     }
@@ -963,8 +900,8 @@ static void drawBrowser() {
   audioPumpPlayingMax(384);
 }
 
-// ── Splash / tela inicial ─────────────────────────────────
-// Opcional: imagem perfeita a partir do SD — ficheiro RAW RGB565 little-endian, exatamente SP_RAW_W*SP_RAW_H*2 bytes.
+// ── Splash / startup screen ─────────────────────────────────
+// Optional: perfect image from SD — RAW RGB565 little-endian, exactly SP_RAW_W*SP_RAW_H*2 bytes.
 static const char* const SPLASH_RAW_PATH = "/guara565.raw";
 static const int SP_RAW_W = 200;
 static const int SP_RAW_H = 218;
@@ -974,7 +911,7 @@ static inline void splashDrawPlus(int x, int y, uint16_t c) {
   tft.drawFastHLine(x - 2, y, 5, c);
 }
 
-/** Tenta desenhar o logo a partir do cartão (qualidade máxima). */
+/** Try to draw logo from SD card (best quality). */
 static bool tryDrawSplashFromSD(int dstX, int dstY) {
   File f = SD.open(SPLASH_RAW_PATH, FILE_READ);
   if (!f) return false;
@@ -995,7 +932,7 @@ static bool tryDrawSplashFromSD(int dstX, int dstY) {
   return true;
 }
 
-/** Logo GUARA CREW desenhada (fallback) — estilo monocromático / pixel-art. */
+/** Procedural GUARA CREW logo (fallback) — monochrome / pixel-art style. */
 static void drawGuaraLogoProcedural(int ix, int iy, int iw, int ih) {
   tft.fillRect(ix, iy, iw, ih, COL_BG);
 
@@ -1007,7 +944,7 @@ static void drawGuaraLogoProcedural(int ix, int iy, int iw, int ih) {
   uint16_t sunLo = tft.color565(44, 44, 52);
   uint16_t accPurp = tft.color565(170, 80, 240);
 
-  // “Sol” em meia-lua com scanlines (cordas horizontais)
+  // Half-moon “sun” with scanline-style horizontal chords
   {
     const int syc = iy + 72;
     const int R = 58;
@@ -1020,39 +957,39 @@ static void drawGuaraLogoProcedural(int ix, int iy, int iw, int ih) {
     }
   }
 
-  // Orelhas altas + pelagem
+  // Tall ears + fur
   tft.fillTriangle(cx - 54, iy + 118, cx - 26, iy + 52, cx - 10, iy + 108, furHi);
   tft.fillTriangle(cx + 54, iy + 118, cx + 26, iy + 52, cx + 10, iy + 108, furHi);
   tft.fillTriangle(cx - 50, iy + 122, cx + 50, iy + 122, cx, iy + 198, furHi);
 
-  // Sombra lateral (volume do focinho)
+  // Side shadow (muzzle volume)
   tft.fillTriangle(cx - 46, iy + 128, cx - 8, iy + 128, cx - 28, iy + 188, furMid);
   tft.fillTriangle(cx + 46, iy + 128, cx + 8, iy + 128, cx + 28, iy + 188, furMid);
 
-  // Máscara escura em volta dos olhos
+  // Dark mask around eyes
   tft.fillCircle(cx - 22, iy + 118, 10, furLo);
   tft.fillCircle(cx + 22, iy + 118, 10, furLo);
 
-  // Focinho claro
+  // Light muzzle
   tft.fillTriangle(cx - 18, iy + 138, cx + 18, iy + 138, cx, iy + 186, furMid);
   tft.fillTriangle(cx - 12, iy + 144, cx + 12, iy + 144, cx, iy + 178, furHi);
 
-  // Olhos
+  // Eyes
   tft.fillCircle(cx - 22, iy + 116, 4, COL_TEXT);
   tft.fillCircle(cx + 22, iy + 116, 4, COL_TEXT);
   tft.fillCircle(cx - 23, iy + 115, 2, COL_BG);
   tft.fillCircle(cx + 21, iy + 115, 2, COL_BG);
 
-  // Nariz
+  // Nose
   tft.fillTriangle(cx - 5, iy + 158, cx + 5, iy + 158, cx, iy + 168, COL_BG);
 
-  // Bigodes / detalhe pixel
+  // Whiskers / pixel detail
   for (int k = 0; k < 4; k++) {
     tft.drawFastHLine(cx - 34 - k * 3, iy + 152 + k, 10, furLo);
     tft.drawFastHLine(cx + 24 + k * 3, iy + 152 + k, 10, furLo);
   }
 
-  // Cruzes decorativas (estética “glitch” suave)
+  // Decorative crosses (soft “glitch” look)
   uint16_t xcol = tft.color565(90, 90, 98);
   splashDrawPlus(ix + 8, iy + 56, xcol);
   splashDrawPlus(ix + 14, iy + 92, COL_DIM);
@@ -1061,7 +998,7 @@ static void drawGuaraLogoProcedural(int ix, int iy, int iw, int ih) {
   splashDrawPlus(cx - 70, iy + 40, COL_DIM);
   splashDrawPlus(cx + 70, iy + 44, COL_DIM);
 
-  // Escudo GUARA (trapézio simulado + sombra)
+  // GUARA shield (simulated trapezoid + outline)
   {
     const int bx = ix + 14, by = iy + 168, bw = iw - 28, bh = 44;
     tft.fillTriangle(bx, by + bh, bx + 8, by, bx + bw - 8, by, furHi);
@@ -1076,7 +1013,7 @@ static void drawGuaraLogoProcedural(int ix, int iy, int iw, int ih) {
     tft.print(g);
   }
 
-  // Faixa CREW
+  // CREW banner
   {
     const int bx2 = ix + 44, by2 = iy + 214, bw2 = iw - 88, bh2 = 28;
     tft.fillRoundRect(bx2, by2, bw2, bh2, 5, furHi);
@@ -1112,7 +1049,7 @@ static void drawStartupScreen() {
   const int innerW = lw - 12;
   const int innerH = lh - 12;
 
-  // Posição centrada para o RAW fixo 200x218
+  // Centered position for fixed 200x218 RAW
   const int rawX = innerX + (innerW - SP_RAW_W) / 2;
   const int rawY = innerY + (innerH - SP_RAW_H) / 2;
 
@@ -1125,7 +1062,7 @@ static void drawStartupScreen() {
   tft.print("BT connecting...");
 }
 
-/** Barra de progresso, tempos e metadados técnicos (atualização periódica no loop). */
+/** Progress bar, times, and technical line (periodic refresh from loop). */
 static void drawPlayerProgressArea() {
   if (screenMode != SCREEN_PLAYER) return;
 
@@ -1172,7 +1109,7 @@ static void drawPlayerProgressArea() {
   if (currentType == AUDIO_WAV && cachedWavRateHz > 0)
     tft.printf("WAV / %lu Hz / PCM", (unsigned long)cachedWavRateHz);
   else if (currentType == AUDIO_MP3)
-    tft.print("MP3 / ~128 kbps (est.)");
+    tft.print("MP3 / ~128 kbps (approx.)");
   else
     tft.print("---");
 }
@@ -1186,7 +1123,7 @@ static void drawVolumeControls() {
   uint16_t fg = COL_TEXT;
   const int cy = y + 15;
 
-  // Ícone “−” (barra espessa, estilo transporte)
+  // Minus icon (thick bar, transport style)
   {
     const int cx = 10 + 56 / 2;
     tft.fillRoundRect(cx - 10, cy - 3, 20, 6, 2, fg);
@@ -1200,7 +1137,7 @@ static void drawVolumeControls() {
   tft.setCursor((SCR_W / 2) - (tw / 2), y + 11);
   tft.print(vbuf);
 
-  // Ícone “+” (cruz com traços espessos)
+  // Plus icon (thick cross)
   {
     const int cx = 174 + 56 / 2;
     tft.fillRoundRect(cx - 2, cy - 10, 4, 20, 1, fg);
@@ -1208,7 +1145,7 @@ static void drawVolumeControls() {
   }
 }
 
-/** Ícone de lista (marcas + linhas) no botão de voltar às pastas. */
+/** List icon (bullets + lines) on back-to-browser button. */
 static void drawPlayerListBackIcon() {
   int bx = PL_BACK_BTN_X, by = PL_BACK_BTN_Y, bw = PL_BACK_BTN_W, bh = PL_BACK_BTN_H;
   tft.fillRoundRect(bx, by, bw, bh, 4, tft.color565(36, 36, 42));
@@ -1227,11 +1164,11 @@ static void drawPlayerListBackIcon() {
 static void drawPlayer() {
   tft.fillScreen(COL_BG);
 
-  // ── Barra de estado (estilo DAP) ─────────────────────────
+  // ── Status bar (DAP style) ───────────────────────────────
   tft.fillRect(0, 0, SCR_W, PL_HEADER_H, colTopBarBg());
   tft.drawFastHLine(0, PL_HEADER_H - 1, SCR_W, tft.color565(40, 40, 48));
 
-  // Ícone de nota musical (roxo)
+  // Music note icon (purple)
   uint16_t noteCol = tft.color565(170, 80, 240);
   tft.fillCircle(9, 17, 3, noteCol);
   tft.fillCircle(17, 15, 3, noteCol);
@@ -1274,17 +1211,17 @@ static void drawPlayer() {
   drawPlayerListBackIcon();
   audioPumpPlayingMax(160);
 
-  // ── Título da faixa ─────────────────────────────────────
+  // ── Track title ───────────────────────────────────────────
   char title[64];
   if (trackCount > 0)
-    getDisplayName(playlist[resolveTrack(currentTrack)], title, sizeof(title));
+    getDisplayName(playlist[currentTrack], title, sizeof(title));
   else
-    strncpy(title, "Sem faixa", sizeof(title) - 1);
+    strncpy(title, "No track", sizeof(title) - 1);
   title[sizeof(title) - 1] = '\0';
   tft.setTextSize(1);
   drawTitleCentered(PL_TITLE_Y, 220, title);
 
-  // ── Visualizador (barras por banda de frequência) ───────
+  // ── Visualizer (per-frequency bars) ───────────────────────
   drawVisualizerPanel();
   audioPumpPlayingMax(220);
 
@@ -1293,7 +1230,7 @@ static void drawPlayer() {
   lastProgressUiMs = millis();
   audioPumpPlayingMax(220);
 
-  // ── Transporte ───────────────────────────────────────────
+  // ── Transport controls ────────────────────────────────────
   const int y = PL_TRANSPORT_Y;
   tft.fillRoundRect(10, y, 56, 42, 7, COL_BTN);
   tft.fillRoundRect(74, y, 92, 42, 7, COL_BTN);
@@ -1376,16 +1313,11 @@ static void handleTouch() {
       return;
     }
 
-    if (ty >= browsePathY - 2 && ty < browseListY) {
-      if (shuffleMode == SHUFFLE_OFF) {
-        shuffleMode = SHUFFLE_TRACKS;
-        generateShuffleOrder();
-      } else if (shuffleMode == SHUFFLE_TRACKS) {
-        shuffleMode = SHUFFLE_ALBUM;
-      } else {
-        shuffleMode = SHUFFLE_OFF;
-      }
-      drawBrowser();
+    if (trackCount > 0 &&
+        ty >= BROWSE_PATH_PLAY_BTN_Y && ty < BROWSE_PATH_PLAY_BTN_Y + BROWSE_PATH_PLAY_BTN_H &&
+        tx >= BROWSE_PATH_PLAY_BTN_X && tx < BROWSE_PATH_PLAY_BTN_X + BROWSE_PATH_PLAY_BTN_W) {
+      screenMode = SCREEN_PLAYER;
+      drawPlayer();
       return;
     }
 
@@ -1444,7 +1376,7 @@ static void handleTouch() {
     screenMode = SCREEN_PLAYER;
     drawPlayer();
   } else { // SCREEN_PLAYER
-    // Lista: volta às pastas; a música continua a tocar
+    // List: back to folders; playback continues
     if (ty >= PL_BACK_BTN_Y && ty < PL_BACK_BTN_Y + PL_BACK_BTN_H &&
         tx >= PL_BACK_BTN_X && tx < PL_BACK_BTN_X + PL_BACK_BTN_W) {
       screenMode = SCREEN_BROWSER;
@@ -1453,7 +1385,7 @@ static void handleTouch() {
       return;
     }
 
-    // volume row (10% por toque)
+    // Volume row (10% per tap)
     if (ty >= PL_VOLUME_Y && ty <= PL_VOLUME_Y + 32) {
       if (tx < 68) {
         volumePercent -= 10;
@@ -1537,14 +1469,13 @@ void setup() {
     tft.setTextColor(TFT_YELLOW, COL_BG);
     tft.setTextSize(2);
     tft.setCursor(20, 120);
-    tft.print("Sem musicas");
+    tft.print("No music");
     while (1) {
       rgbLedUpdate();
       delay(500);
     }
   }
   scanAlbums();
-  generateShuffleOrder();
   browseLevel = BROWSE_ALBUMS;
   browseAlbumIdx = -1;
   browseTrackScroll = 0;

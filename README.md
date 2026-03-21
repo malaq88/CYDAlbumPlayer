@@ -16,7 +16,7 @@ Place these JPEGs in the **repository root** (same directory as `README.md`) whe
 
 | File | What it shows |
 |------|----------------|
-| **`AlbumPlaylist.jpeg`** | **Album browser:** folder list, **Leitor** button (return to player when a session exists), **PREV/NEXT** paging, BT status in the header. |
+| **`AlbumPlaylist.jpeg`** | **Album browser:** folder list, **Player** button in the header (return to playback when tracks exist), **play** button on the path row (same action), **PREV/NEXT** paging, BT status in the header. |
 | **`Execution_screen.jpeg`** | **Playback screen:** spectrum (“SPECTRUM”) bars, track title, progress and times, album line, technical line, volume **−/+%/+**, transport controls, list icon (top-right). |
 
 ![Album browser — file: AlbumPlaylist.jpeg](AlbumPlaylist.jpeg)
@@ -59,7 +59,7 @@ The playback view is laid out for a **240×320** portrait panel and is inspired 
   - Thin **progress bar** (red fill when duration is known).
   - **Elapsed** and **total** time as `HH:MM:SS`; total shows `--:--:--` when duration is unknown.
   - Folder line (dim text).
-  - **Cyan** technical line: **`WAV / sample-rate Hz / PCM`** when parsed from the file header, or **`MP3 / ~128 kbps (est.)`** for MP3.
+  - **Cyan** technical line: **`WAV / sample-rate Hz / PCM`** when parsed from the file header, or **`MP3 / ~128 kbps (approx.)`** for MP3.
 
 **Timing**
 
@@ -70,7 +70,7 @@ The playback view is laid out for a **240×320** portrait panel and is inspired 
 **Touch targets**
 
 - **List icon** (top-right, `PL_BACK_BTN_*`) switches to the album browser; **playback continues** (pause/play state unchanged).
-- **Leitor** (browser header, only when an album is already loaded): returns to the player screen **without** restarting the track.
+- **Player** (browser header, when tracks exist) or the **play** button on the path row below: returns to the playback screen **without** restarting the track.
 - Tapping a **different album** in the list **stops the current decode briefly** before scanning the new folder on the SD card (avoids SPI/SD contention with MP3 streaming, which used to cause Bluetooth stutter). Then playback starts from track 1 of the new album. While browsing (list open), the sketch also **pumps the audio decoder** during TFT redraws and touch waits so the buffer stays fuller.
 - **Prev / Play–Pause / Next** are in the bottom transport bar (see `PL_TRANSPORT_Y` in the sketch).
 

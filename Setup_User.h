@@ -38,8 +38,8 @@
 // ── STEP 1: Uncomment ONE driver ────────────────────────────
 // Try them in this order if your screen is white/blank:
 //
-// TPM408-2.8 (2.8" 240x320) normalmente usa ILI9341.
-// Se suas cores estiverem "mortas/lavadas", o driver provavelmente está errado.
+// TPM408-2.8 (2.8" 240x320) usually uses ILI9341.
+// If colors look washed/dead, the driver choice is probably wrong.
 // Un-comment the one that matches your controller:
 #define ILI9341_2_DRIVER     // Alternative ILI9341 driver, see https://github.com/Bodmer/TFT_eSPI/issues/1172
 //#define ILI9341_DRIVER          // TPM408-2.8 / ILI9341
@@ -98,7 +98,7 @@
 //
 // Note: The CYD touch controller (XPT2046) is on a SEPARATE
 // SPI bus (HSPI) with its own pins. It is NOT configured here
-// because ShuffleCYD handles it in code. For reference:
+// because the sketch configures it in code. For reference:
 //   Touch CLK  = GPIO 25
 //   Touch MISO = GPIO 39
 //   Touch MOSI = GPIO 32
