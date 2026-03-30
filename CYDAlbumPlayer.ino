@@ -18,6 +18,8 @@
 #include <AudioOutput.h>
 
 #include "BluetoothA2DPSource.h"
+#include "esp_gap_bt_api.h"
+#include "freertos/portmacro.h"
 
 // ── Hardware pins ───────────────────────────────────────────
 #define SD_CS      5
@@ -81,10 +83,67 @@ static inline uint16_t colTopBarBg()  { return tft.color565(10, 10, 12); }
 static unsigned long lastTouchTime = 0;
 static const unsigned long TOUCH_DEBOUNCE_MS = 220;
 
-// ── Bluetooth (fixed headset) ─────────────────────────────
-static const char* BT_SPEAKER_NAME = "E6";
+// ── Bluetooth (A2DP source: scan list + touch pick) ────────
+#define BT_SCAN_MAX        24
+#define BT_NAME_BUF        40
+struct BtScanEntry {
+  char     name[BT_NAME_BUF];
+  uint8_t  addr[ESP_BD_ADDR_LEN];
+  int      rssi;
+};
+static BtScanEntry btScanList[BT_SCAN_MAX];
+static int         btScanCount = 0;
+static portMUX_TYPE btScanMux = portMUX_INITIALIZER_UNLOCKED;
+static bool        btUserHasChoice = false;
+static uint8_t     btChosenAddr[ESP_BD_ADDR_LEN];
+
 BluetoothA2DPSource a2dp;
 static bool btConnected = false;
+/** Short label for HUD after connection (from remote name). */
+static char btPeerDisplayName[BT_NAME_BUF] = "";
+
+static bool btAddrEquals(const uint8_t* a, const uint8_t* b) {
+  return memcmp(a, b, ESP_BD_ADDR_LEN) == 0;
+}
+
+/** Called from BT stack during inquiry; add unique devices, optionally accept chosen one. */
+static bool btScanSsidCallback(const char* ssid, esp_bd_addr_t address, int rssi) {
+  bool accept = false;
+  portENTER_CRITICAL(&btScanMux);
+
+  bool duplicate = false;
+  for (int i = 0; i < btScanCount; i++) {
+    if (btAddrEquals(btScanList[i].addr, address)) {
+      duplicate = true;
+      break;
+    }
+  }
+  if (!duplicate && btScanCount < BT_SCAN_MAX) {
+    BtScanEntry* e = &btScanList[btScanCount++];
+    memset(e, 0, sizeof(*e));
+    if (ssid && ssid[0]) {
+      strncpy(e->name, ssid, sizeof(e->name) - 1);
+    } else {
+      strncpy(e->name, "(no name)", sizeof(e->name) - 1);
+    }
+    e->name[sizeof(e->name) - 1] = '\0';
+    memcpy(e->addr, address, ESP_BD_ADDR_LEN);
+    e->rssi = rssi;
+  }
+
+  if (btUserHasChoice && memcmp(address, btChosenAddr, ESP_BD_ADDR_LEN) == 0) {
+    accept = true;
+  }
+  portEXIT_CRITICAL(&btScanMux);
+  return accept;
+}
+
+static int btScanCountSnapshot() {
+  portENTER_CRITICAL(&btScanMux);
+  int n = btScanCount;
+  portEXIT_CRITICAL(&btScanMux);
+  return n;
+}
 
 // ── Ring buffer for A2DP audio ────────────────────────────
 #define RING_SIZE 4096
@@ -825,13 +884,16 @@ static void drawBrowser() {
 
   tft.setTextColor(btCol, COL_BTN);
   tft.setCursor(180, 10);
-  if (btConnected) {
-    char bname[10];
-    strncpy(bname, BT_SPEAKER_NAME, sizeof(bname) - 1);
+  if (btConnected && btPeerDisplayName[0]) {
+    char bname[12];
+    strncpy(bname, btPeerDisplayName, sizeof(bname) - 1);
     bname[sizeof(bname) - 1] = '\0';
     tft.print(bname);
+  } else if (btConnected) {
+    tft.print("OK");
+  } else {
+    tft.print("BT..");
   }
-  else              tft.print("BT..");
 
   if (trackCount > 0) {
     int bx = BROWSE_PLAYER_BTN_X, by = BROWSE_PLAYER_BTN_Y, bw = BROWSE_PLAYER_BTN_W, bh = BROWSE_PLAYER_BTN_H;
@@ -1058,8 +1120,8 @@ static void drawStartupScreen() {
 
   tft.setTextSize(1);
   tft.setTextColor(COL_DIM, COL_BG);
-  tft.setCursor(48, 306);
-  tft.print("BT connecting...");
+  tft.setCursor(40, 306);
+  tft.print("Preparing Bluetooth...");
 }
 
 /** Progress bar, times, and technical line (periodic refresh from loop). */
@@ -1279,6 +1341,192 @@ static bool getTouchXY(int16_t &tx, int16_t &ty) {
   return true;
 }
 
+// ── Bluetooth device picker (startup) ──────────────────────
+static const int BT_PICK_HEADER_H = 30;
+static const int BT_PICK_LIST_Y    = 42;
+static const int BT_PICK_ITEM_H    = 24;
+static int       btPickScroll      = 0;
+
+static inline int btPickVisibleSlots() {
+  int vis = (footerY() - BT_PICK_LIST_Y) / BT_PICK_ITEM_H;
+  return max(1, vis);
+}
+
+/** @param connecting  Show "Connecting..." state */
+static void drawBluetoothPicker(bool connecting) {
+  tft.fillScreen(COL_BG);
+  tft.fillRect(0, 0, SCR_W, BT_PICK_HEADER_H, COL_BTN);
+  tft.setTextColor(COL_TEXT, COL_BTN);
+  tft.setTextSize(1);
+  tft.setCursor(6, 4);
+  tft.print("Bluetooth — pick speaker");
+
+  tft.setTextColor(COL_DIM, COL_BG);
+  tft.setCursor(8, BT_PICK_LIST_Y - 14);
+  int nPre = btScanCountSnapshot();
+  if (connecting)
+    tft.print("Connecting... please wait");
+  else if (nPre == 0)
+    tft.print("Scanning... bring headset nearby");
+  else
+    tft.print("Tap a device:");
+
+  int vis = btPickVisibleSlots();
+  int n = nPre;
+  int fY = footerY();
+
+  for (int row = 0; row < vis; row++) {
+    int idx = btPickScroll + row;
+    int y = BT_PICK_LIST_Y + row * BT_PICK_ITEM_H;
+    if (idx >= n) break;
+
+    char nmCopy[BT_NAME_BUF];
+    int rssi = -128;
+    portENTER_CRITICAL(&btScanMux);
+    strncpy(nmCopy, btScanList[idx].name, sizeof(nmCopy) - 1);
+    nmCopy[sizeof(nmCopy) - 1] = '\0';
+    rssi = btScanList[idx].rssi;
+    portEXIT_CRITICAL(&btScanMux);
+
+    char line[BT_NAME_BUF + 16];
+    snprintf(line, sizeof(line), "%.28s  %d", nmCopy, rssi);
+
+    tft.fillRoundRect(6, y + 1, SCR_W - 12, BT_PICK_ITEM_H - 3, 5, COL_BTN);
+    tft.setTextColor(COL_TEXT, COL_BTN);
+    tft.setTextSize(1);
+    tft.setCursor(10, y + 7);
+    tft.print(line);
+  }
+
+  tft.fillRoundRect(8, fY + 6, 58, 24, 5, COL_BTN);
+  tft.fillRoundRect(174, fY + 6, 58, 24, 5, COL_BTN);
+  tft.setTextColor(COL_TEXT, COL_BTN);
+  tft.setCursor(20, fY + 15);
+  tft.print("PREV");
+  tft.setCursor(186, fY + 15);
+  tft.print("NEXT");
+
+  int totalPages = max(1, (n + vis - 1) / vis);
+  int page = (n == 0) ? 1 : min(totalPages, (btPickScroll / vis) + 1);
+  tft.setTextColor(COL_DIM, COL_BG);
+  tft.setCursor(104, fY + 15);
+  tft.printf("%d/%d", page, totalPages);
+}
+
+static void handleBluetoothPickerTouch(bool* redraw) {
+  int16_t tx, ty;
+  if (!getTouchXY(tx, ty)) return;
+
+  unsigned long now = millis();
+  if (now - lastTouchTime < TOUCH_DEBOUNCE_MS) return;
+  lastTouchTime = now;
+
+  while (ts.touched()) delay(1);
+
+  int fY = footerY();
+  int vis = btPickVisibleSlots();
+  int n = btScanCountSnapshot();
+
+  if (ty >= fY && ty < SCR_H && tx <= 72) {
+    btPickScroll = max(0, btPickScroll - vis);
+    if (redraw) *redraw = true;
+    return;
+  }
+  if (ty >= fY && ty < SCR_H && tx >= 168) {
+    if (btPickScroll + vis < n) btPickScroll += vis;
+    if (redraw) *redraw = true;
+    return;
+  }
+
+  int listBottom = BT_PICK_LIST_Y + vis * BT_PICK_ITEM_H;
+  if (ty < BT_PICK_LIST_Y || ty >= listBottom) return;
+
+  int row = (ty - BT_PICK_LIST_Y) / BT_PICK_ITEM_H;
+  int idx = btPickScroll + row;
+  if (idx < 0 || idx >= n) return;
+
+  portENTER_CRITICAL(&btScanMux);
+  memcpy(btChosenAddr, btScanList[idx].addr, ESP_BD_ADDR_LEN);
+  char picked[BT_NAME_BUF];
+  strncpy(picked, btScanList[idx].name, sizeof(picked) - 1);
+  picked[sizeof(picked) - 1] = '\0';
+  btUserHasChoice = true;
+  portEXIT_CRITICAL(&btScanMux);
+
+  strncpy(btPeerDisplayName, picked, sizeof(btPeerDisplayName) - 1);
+  btPeerDisplayName[sizeof(btPeerDisplayName) - 1] = '\0';
+
+  if (redraw) *redraw = true;
+}
+
+/**
+ * Waits until A2DP is connected. Shows the scan list after a short delay;
+ * user taps a device (library connects on the next inquiry hit for that address).
+ */
+static void runBluetoothPickerUntilConnected() {
+  /** Small grace period before opening picker screen. */
+  const unsigned long kPickerShowMs = 2000;
+  unsigned long tStart = millis();
+  bool showedUi = false;
+  int lastSnap = -1;
+  bool connectingUi = false;
+
+  btPickScroll = 0;
+  btUserHasChoice = false;
+
+  while (!a2dp.is_connected()) {
+    rgbLedUpdate();
+
+    if (!showedUi) {
+      unsigned long elapsed = millis() - tStart;
+      if (elapsed > kPickerShowMs) {
+        drawBluetoothPicker(false);
+        showedUi = true;
+        lastSnap = btScanCountSnapshot();
+      }
+    }
+
+    if (showedUi) {
+      bool redraw = false;
+      handleBluetoothPickerTouch(&redraw);
+      int snap = btScanCountSnapshot();
+
+      if (btUserHasChoice && !connectingUi) {
+        drawBluetoothPicker(true);
+        connectingUi = true;
+        lastSnap = snap;
+      } else if (redraw && !connectingUi) {
+        drawBluetoothPicker(false);
+        lastSnap = btScanCountSnapshot();
+      } else if (!connectingUi && snap != lastSnap) {
+        drawBluetoothPicker(false);
+        lastSnap = snap;
+      }
+    }
+    delay(15);
+  }
+
+  if (showedUi) {
+    tft.fillScreen(COL_BG);
+    tft.setTextSize(2);
+    tft.setTextColor(COL_ACCENT, COL_BG);
+    const char* ok = "Bluetooth on";
+    int w = (int)strlen(ok) * 12;
+    tft.setCursor((SCR_W - w) / 2, 140);
+    tft.print(ok);
+    delay(350);
+  }
+
+  const char* n = a2dp.get_name();
+  if (n && n[0]) {
+    strncpy(btPeerDisplayName, n, sizeof(btPeerDisplayName) - 1);
+    btPeerDisplayName[sizeof(btPeerDisplayName) - 1] = '\0';
+  } else if (!btPeerDisplayName[0]) {
+    strncpy(btPeerDisplayName, "BT", sizeof(btPeerDisplayName) - 1);
+    btPeerDisplayName[sizeof(btPeerDisplayName) - 1] = '\0';
+  }
+}
+
 static void handleTouch() {
   int16_t tx, ty;
   if (!getTouchXY(tx, ty)) return;
@@ -1451,15 +1699,15 @@ void setup() {
 
   drawStartupScreen();
 
-  a2dp.set_auto_reconnect(true);
+  // Always show device picker on boot (no auto-reconnect to a previously saved speaker).
+  a2dp.set_auto_reconnect(false);
+  a2dp.clean_last_connection();
   a2dp.set_volume(127);
-  a2dp.start(BT_SPEAKER_NAME, btCallback);
+  a2dp.set_data_callback_in_frames(btCallback);
+  a2dp.set_ssid_callback(btScanSsidCallback);
+  a2dp.start();
 
-  unsigned long t0 = millis();
-  while (!a2dp.is_connected() && millis() - t0 < 15000) {
-    rgbLedUpdate();
-    delay(50);
-  }
+  runBluetoothPickerUntilConnected();
   btConnected = a2dp.is_connected();
   rgbPrevBt = btConnected;
   rgbPrevPlaying = (playerState == STATE_PLAYING);

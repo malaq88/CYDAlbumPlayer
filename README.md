@@ -41,7 +41,7 @@ On typical **ESP32-2432S028R** boards, the rear RGB LED uses three GPIOs and is 
 | Bluetooth connected and track **playing** | Alternating **green** and **blue** (one colour on at a time, ~450 ms). |
 | Bluetooth connected but **paused** / **stopped** | LED off. |
 
-The Bluetooth wait loop at startup calls the same update routine so the LED animates while the A2DP sink connects.
+At startup, while Bluetooth is scanning or pairing, the sketch runs the same LED update routine so the LED animates until a headset/speaker connects.
 
 Clones may use different pins or polarity; adjust `RGB_LED_RED` / `RGB_LED_GREEN` / `RGB_LED_BLUE` in `CYDAlbumPlayer.ino` if needed.
 
@@ -128,22 +128,17 @@ In `Setup_User.h`:
 
 If you switch your driver to something else (e.g., ST7789), and the colors look off, consider commenting out that gamma block or adjust it.
 
-## Bluetooth pairing/name configuration (required)
+## Bluetooth device selection (fixed name removed)
 
-You must change the variable that selects the Bluetooth target device:
+**Update:** Bluetooth pairing no longer uses a hard-coded speaker name in the sketch. On each boot the player **scans for nearby audio devices** (A2DP sink class), **lists them on the touchscreen** (with signal strength), and you **tap the headset or speaker** you want. The UI proceeds to the SD music browser only **after** A2DP connects.
 
-`BT_SPEAKER_NAME`
+Implementation notes:
 
-In `CYDAlbumPlayer.ino` it is currently:
+- Startup uses `BluetoothA2DPSource` with a **SSID / inquiry callback** to collect discovered devices and to accept the **address** of the one you tapped.
+- **Auto-reconnect is turned off** on boot and the **last saved peer is cleared** so the device always goes through the picker (you are not locked to one fixed name such as the old `"E6"` example).
+- Only devices that report a compatible **Class of Device** (audio/rendering, as filtered by ESP32-A2DP) appear in the list.
 
-```cpp
-static const char* BT_SPEAKER_NAME = "E6";
-```
-
-Set `BT_SPEAKER_NAME` to the **exact name** shown by your Bluetooth speaker/headset (the device that will receive the audio).
-
-This value is used here:
-- `a2dp.start(BT_SPEAKER_NAME, btCallback);`
+After the **WELCOME** splash, you may see **“Preparing Bluetooth…”** briefly, then the picker screen (**“Bluetooth — pick speaker”**, **“Scanning…”**, **“Tap a device:”**). There can be a short delay before the first scan results while the stack initialises.
 
 ## SD Card layout expected by this project
 
@@ -210,8 +205,7 @@ You need these dependencies available in Arduino IDE:
 
 1. Select your ESP32 board in Arduino IDE.
 2. Ensure TFT_eSPI is configured using the `Setup_User.h` reference.
-3. Set `BT_SPEAKER_NAME` to your Bluetooth device name.
-4. Compile and upload `CYDAlbumPlayer.ino`.
+3. Compile and upload `CYDAlbumPlayer.ino`. On first run after upload, use the on-screen list to pick your Bluetooth speaker or headset.
 
 If you want, paste the last ~30 lines of your Arduino compile log (especially the first real `error:` if any) and I can help confirm board/driver configuration.
 
