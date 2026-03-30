@@ -9,6 +9,8 @@ ESP32 “CYD” music player that:
 - Shows a **DAP-style player screen** (dark theme, status bar, **spectrum visualizer** — 16 frequency bars driven from the audio, progress bar, timestamps, technical line in cyan) plus volume **+/−** and touch transport controls.
 - Uses the **on-board RGB LED** on the back as a Bluetooth / playback indicator.
 - Acts as a **Bluetooth A2DP Source** (sends the audio to a Bluetooth speaker/headset).
+- **Bluetooth setup:** on boot, **scans nearby audio devices** and lets you **pick a speaker/headset from a touch list** (no fixed device name in code).
+- **Display power:** after **30 seconds** without touch, the **backlight turns off**; **touch is ignored** while off; the **BOOT** button (**GPIO 0**) **toggles** the backlight on or off (Bluetooth and playback keep running).
 
 ## Screenshots
 
@@ -81,7 +83,9 @@ The pin mapping in this project is defined in `CYDAlbumPlayer.ino` and matches t
 - SD card (SPI):
   - `SD_CS = 5` (`#define SD_CS 5`)
 - TFT backlight:
-  - `TFT_BL = 21` (`#define TFT_BL 21`)
+  - `TFT_BL = 21` (`#define TFT_BL 21`) — `HIGH` turns the backlight on in this sketch; `LOW` turns it off.
+- **BOOT** button (board tack switch used in firmware):
+  - `BOOT_BUTTON_PIN = 0` — read with `INPUT_PULLUP`; **pressed** = LOW. Used as a **debounced toggle** for the backlight (see **Display power & touch** below). **GPIO 0 is an ESP32 strapping pin:** if BOOT is held low while the chip **resets**, the module may enter **download / flash mode** instead of running your sketch; release BOOT and reset to boot normally.
 - Touch controller (XPT2046 on its own HSPI bus):
   - `TOUCH_CLK = 25`
   - `TOUCH_MISO = 39`
@@ -139,6 +143,23 @@ Implementation notes:
 - Only devices that report a compatible **Class of Device** (audio/rendering, as filtered by ESP32-A2DP) appear in the list.
 
 After the **WELCOME** splash, you may see **“Preparing Bluetooth…”** briefly, then the picker screen (**“Bluetooth — pick speaker”**, **“Scanning…”**, **“Tap a device:”**). There can be a short delay before the first scan results while the stack initialises.
+
+## Display power & touch (backlight timeout, BOOT toggle)
+
+The sketch treats **“screen off”** as **backlight off** on **`TFT_BL` (GPIO 21)**. The TFT controller keeps its last image in memory; only the backlight is switched so playback and Bluetooth are **not** stopped.
+
+| Behaviour | Detail |
+|-----------|--------|
+| **Idle timeout** | If there is **no valid touchscreen interaction** for **`DISPLAY_IDLE_OFF_MS`** (default **30 seconds**, in `CYDAlbumPlayer.ino`), the backlight is driven **LOW** and the display looks off. |
+| **Touch while “off”** | **`handleTouch()`** and the **Bluetooth picker** handler **return immediately** when the backlight is off: the code does **not** read the touch controller for UI actions, so bumps on the panel do not change track, volume, or browser state. |
+| **BOOT button** | A **short press** on the **BOOT** switch (**GPIO 0**, debounced in software) **toggles** the backlight: **on → off** or **off → on**. When back on, the **album browser or player screen is redrawn** once so the UI matches the current state. |
+| **Automatic dim vs manual** | The same **BOOT** toggle works whether the backlight was turned off by the **idle timer** or by **pressing BOOT** while the screen was on. |
+| **While backlight is off** | **RGB LED** logic still runs. **A2DP** and **audio decode** keep running. **Progress bar** and **spectrum** updates are **skipped** (less SPI traffic while you cannot see the panel). |
+| **Bluetooth picker** | During startup pairing, **idle timeout** and **BOOT** still apply; **touch is ignored** if the backlight is off, so use **BOOT** to turn the panel on again if needed. |
+
+**Tuning:** change **`DISPLAY_IDLE_OFF_MS`** near the top of `CYDAlbumPlayer.ino` if you want a longer or shorter timeout.
+
+**Clone / hardware note:** Some CYD revisions wire the backlight differently (always on, or inverted logic). If **on/off** seems reversed, swap the **`HIGH`** / **`LOW`** levels used for **`TFT_BL`** in the sketch.
 
 ## SD Card layout expected by this project
 

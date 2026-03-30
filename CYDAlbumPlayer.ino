@@ -26,6 +26,8 @@
 #define TOUCH_CS   33
 #define TOUCH_IRQ  36
 #define TFT_BL     21
+/** CYD BOOT (strapping pin — avoid holding at chip reset). Active LOW when pressed. */
+#define BOOT_BUTTON_PIN 0
 
 // Rear RGB on CYD (ESP32-2432S028R): R=4, G=16, B=17 — active LOW (LOW = on).
 // Clones may differ; the front “LED” on many boards is chassis reflection, not another GPIO.
@@ -82,6 +84,65 @@ static inline uint16_t colTopBarBg()  { return tft.color565(10, 10, 12); }
 
 static unsigned long lastTouchTime = 0;
 static const unsigned long TOUCH_DEBOUNCE_MS = 220;
+
+// ── Display backlight idle timeout ────────────────────────
+static const unsigned long DISPLAY_IDLE_OFF_MS = 30000;
+static bool                displayBacklightOn     = true;
+static unsigned long       lastUserActivityMs     = 0;
+/** 0 idle, 1 debouncing down, 2 latched until release */
+static uint8_t bootBtnPhase = 0;
+static unsigned long bootBtnMs = 0;
+/** False during BT picker / splash; avoids wrong redraw on wake. */
+static bool mainPlayerUiReady = false;
+static bool displayWakeNeedsRedraw = false;
+
+/** Touch is ignored while backlight is off; only BOOT toggles the display. */
+static void noteUserActivity() {
+  if (!displayBacklightOn) return;
+  lastUserActivityMs = millis();
+}
+
+/** Debounced BOOT: turn display off if on, on if off (toggle). */
+static void toggleBacklightWithBoot() {
+  if (displayBacklightOn) {
+    digitalWrite(TFT_BL, LOW);
+    displayBacklightOn = false;
+  } else {
+    digitalWrite(TFT_BL, HIGH);
+    displayBacklightOn = true;
+    lastUserActivityMs = millis();
+    if (mainPlayerUiReady) displayWakeNeedsRedraw = true;
+  }
+}
+
+static void updateDisplayBacklightTimeout() {
+  if (!displayBacklightOn) return;
+  if (millis() - lastUserActivityMs >= DISPLAY_IDLE_OFF_MS) {
+    digitalWrite(TFT_BL, LOW);
+    displayBacklightOn = false;
+  }
+}
+
+/** Debounced BOOT press; does not block (safe for audio loop). */
+static void pollBootButton() {
+  bool down = (digitalRead(BOOT_BUTTON_PIN) == LOW);
+  unsigned long now = millis();
+  if (bootBtnPhase == 0) {
+    if (down) {
+      bootBtnPhase = 1;
+      bootBtnMs = now;
+    }
+  } else if (bootBtnPhase == 1) {
+    if (!down) {
+      bootBtnPhase = 0;
+    } else if (now - bootBtnMs >= 45) {
+      toggleBacklightWithBoot();
+      bootBtnPhase = 2;
+    }
+  } else {
+    if (!down) bootBtnPhase = 0;
+  }
+}
 
 // ── Bluetooth (A2DP source: scan list + touch pick) ────────
 #define BT_SCAN_MAX        24
@@ -1414,8 +1475,11 @@ static void drawBluetoothPicker(bool connecting) {
 }
 
 static void handleBluetoothPickerTouch(bool* redraw) {
+  if (!displayBacklightOn) return;
+
   int16_t tx, ty;
   if (!getTouchXY(tx, ty)) return;
+  noteUserActivity();
 
   unsigned long now = millis();
   if (now - lastTouchTime < TOUCH_DEBOUNCE_MS) return;
@@ -1476,6 +1540,8 @@ static void runBluetoothPickerUntilConnected() {
 
   while (!a2dp.is_connected()) {
     rgbLedUpdate();
+    pollBootButton();
+    updateDisplayBacklightTimeout();
 
     if (!showedUi) {
       unsigned long elapsed = millis() - tStart;
@@ -1528,8 +1594,11 @@ static void runBluetoothPickerUntilConnected() {
 }
 
 static void handleTouch() {
+  if (!displayBacklightOn) return;
+
   int16_t tx, ty;
   if (!getTouchXY(tx, ty)) return;
+  noteUserActivity();
 
   unsigned long now = millis();
   if (now - lastTouchTime < TOUCH_DEBOUNCE_MS) return;
@@ -1669,6 +1738,8 @@ void setup() {
   pinMode(TFT_BL, OUTPUT);
   digitalWrite(TFT_BL, HIGH);
 
+  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+
   tft.init();
   // "Gamma" adjustment for the ILI9341_2 (some CYD boards have washed-out colors)
   // Reported common sequence to improve quality after inversion/initial gamma.
@@ -1730,22 +1801,35 @@ void setup() {
   screenMode = SCREEN_BROWSER;
   albumScroll = 0;
   drawBrowser();
+
+  lastUserActivityMs = millis();
+  mainPlayerUiReady = true;
 }
 
 void loop() {
   rgbLedUpdate();
+  pollBootButton();
+  updateDisplayBacklightTimeout();
 
-  if (screenMode == SCREEN_PLAYER &&
-      (playerState == STATE_PLAYING || playerState == STATE_PAUSED)) {
-    unsigned long now = millis();
-    if (now - lastProgressUiMs >= 450) {
-      lastProgressUiMs = now;
-      drawPlayerProgressArea();
-    }
+  if (displayWakeNeedsRedraw) {
+    displayWakeNeedsRedraw = false;
+    if (screenMode == SCREEN_PLAYER) drawPlayer();
+    else drawBrowser();
   }
 
-  if (screenMode == SCREEN_PLAYER)
-    updateVisualizerAnimation();
+  if (displayBacklightOn) {
+    if (screenMode == SCREEN_PLAYER &&
+        (playerState == STATE_PLAYING || playerState == STATE_PAUSED)) {
+      unsigned long now = millis();
+      if (now - lastProgressUiMs >= 450) {
+        lastProgressUiMs = now;
+        drawPlayerProgressArea();
+      }
+    }
+
+    if (screenMode == SCREEN_PLAYER)
+      updateVisualizerAnimation();
+  }
 
   if (playerState == STATE_PLAYING) {
     bool decoderAlive = false;
@@ -1774,7 +1858,7 @@ void loop() {
       // Decoder stopped — wait for the ring buffer to drain before switching tracks with fewer glitches.
       if (rbAvail() < 200) {
         nextTrack(true);
-        if (screenMode == SCREEN_PLAYER) drawPlayer();
+        if (screenMode == SCREEN_PLAYER && displayBacklightOn) drawPlayer();
       }
     }
   }
