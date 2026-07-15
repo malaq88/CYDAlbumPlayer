@@ -4,6 +4,8 @@ Special thanks to **Sparkadium** and the original project **[Cheap-Yellow-MP3-Pl
 
 # CYD Album Player
 
+**Language:** **English** | [Português (BR)](README.pt-BR.md)
+
 ESP32 “CYD” music player that:
 - Scans your SD card by albums (folders) and plays `.mp3` / `.wav` tracks.
 - Shows a **DAP-style player screen** (dark theme, status bar, **spectrum visualizer** — 16 frequency bars driven from the audio, progress bar, timestamps, technical line in cyan) plus volume **+/−** and touch transport controls.
